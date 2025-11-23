@@ -18,13 +18,13 @@ from ij import Prefs, IJ, ImagePlus, ImageStack, ImageStack, WindowManager
 from ij.plugin import ChannelSplitter, RGBStackMerge
 from ij.process import ByteProcessor, ShortProcessor, FloatProcessor, ImageStatistics, ImageProcessor, ImageConverter, Blitter
 from ij.measure import ResultsTable, Measurements, Calibration
-from ij.plugin.filter import ParticleAnalyzer, GaussianBlur, Analyzer, BackgroundSubtracter, MaximumFinder, ThresholdToSelection
+from ij.plugin.filter import ParticleAnalyzer, GaussianBlur, Analyzer, BackgroundSubtracter, MaximumFinder, ThresholdToSelection, RankFilters
 from ij.plugin import RoiEnlarger, ImageCalculator
 from ij.plugin.frame import RoiManager
 from ij.io import FileSaver, RoiEncoder
 from java.io import FileOutputStream, BufferedOutputStream
 from java.util.zip import ZipOutputStream, ZipEntry
-from java.lang import Double
+from java.lang import Double, Throwable, System
 from java.awt import Color
 Prefs.blackBackground = True
 Analyzer.setPrecision(3)
@@ -349,6 +349,7 @@ class SynapseJ4ChannelComplete(object):
         entry = '[{}] {}'.format(stamp, message)
         self.log_messages.append(entry)
         print(entry)
+        sys.stdout.flush()
 
     def _stack_suffix(self, imp):
         """Append the literal word 'stack' to ImageJ commands when z-stacks exist."""
@@ -376,10 +377,13 @@ class SynapseJ4ChannelComplete(object):
         """Run Find Maxima in SEGMENTED mode (macro Maxima_Stack) for dense puncta."""
         segmented_stack = ImageStack(imp.getWidth(), imp.getHeight())
         stack = imp.getStack()
+        n_slices = imp.getNSlices()
         
-        self.log("DEBUG: segment_dense_image processing {} slices".format(imp.getNSlices()))
+        # self.log("DEBUG: segment_dense_image processing {} slices".format(n_slices))
         
-        for slice_idx in range(1, imp.getNSlices() + 1):
+        def process_slice(i):
+            # i is 0-based index for parallel_for, but slices are 1-based
+            slice_idx = i + 1
             ip = stack.getProcessor(slice_idx).duplicate()
             
             # Macro logic: if min > 0, use "above". In API, this means passing the threshold.
@@ -394,7 +398,12 @@ class SynapseJ4ChannelComplete(object):
             
             if segmented_proc is None:
                 segmented_proc = ByteProcessor(imp.getWidth(), imp.getHeight())
-            segmented_stack.addSlice(segmented_proc)
+            return segmented_proc
+
+        results = ParallelUtils.parallel_for(process_slice, n_slices)
+        
+        for proc in results:
+            segmented_stack.addSlice(proc)
             
         segmented_imp = ImagePlus('{} segmented'.format(imp.getTitle()), segmented_stack)
         segmented_imp.setCalibration(imp.getCalibration())
@@ -421,7 +430,7 @@ class SynapseJ4ChannelComplete(object):
         for path in image_files:
             try:
                 self.process_image(path)
-            except Exception as exc:
+            except (Exception, Throwable) as exc:
                 import traceback
                 self.log('ERROR processing {}: {}'.format(path, exc))
                 traceback.print_exc()
@@ -450,8 +459,16 @@ class SynapseJ4ChannelComplete(object):
         cal = imp.getCalibration()
         # Removed forced calibration to match macro behavior (relies on image metadata or user setup)
 
-        pre_entries, pre_result_imp, pre_mask_imp = self.prepare_channel(pre_seg, pre_measure, name_short, 'Pre', cal, self.pre_params)
-        post_entries, post_result_imp, post_mask_imp = self.prepare_channel(post_seg, post_measure, name_short, 'Post', cal, self.post_params)
+        def run_pre():
+            return self.prepare_channel(pre_seg, pre_measure, name_short, 'Pre', cal, self.pre_params)
+        
+        def run_post():
+            return self.prepare_channel(post_seg, post_measure, name_short, 'Post', cal, self.post_params)
+            
+        results = ParallelUtils.run_tasks([run_pre, run_post])
+        pre_entries, pre_result_imp, pre_mask_imp = results[0]
+        post_entries, post_result_imp, post_mask_imp = results[1]
+
         self.log('  Pre detections (pre-marker): {}'.format(len(pre_entries)))
         self.log('  Post detections (post-marker): {}'.format(len(post_entries)))
 
@@ -675,32 +692,41 @@ class SynapseJ4ChannelComplete(object):
     def prepare_channel(self, work_imp, measure_imp, base_name, label, cal, params):
         """Per-channel pipeline matching SynapseJ PrepChannel: Mask -> Subtract -> Analyze."""
         from ij.plugin import ImageCalculator
+        from ij.process import AutoThresholder
 
-        self.log("DEBUG: {} prepare_channel input work_imp slices: {}".format(label, work_imp.getStackSize()))
+        # self.log("DEBUG: {} prepare_channel input work_imp slices: {}".format(label, work_imp.getStackSize()))
 
         if params['blur']:
-            IJ.run(work_imp, 'Median...', self._format_args('radius={}'.format(params['blur_radius']), work_imp))
+            def blur_slice(i):
+                ip = work_imp.getStack().getProcessor(i+1)
+                RankFilters().rank(ip, params['blur_radius'], RankFilters.MEDIAN)
+            ParallelUtils.parallel_for(blur_slice, work_imp.getStackSize())
         
         if params.get('apply_fade') and params.get('fade_factors'):
-            self.apply_fade_correction(work_imp, params['fade_factors'], label)
+            factors = params['fade_factors']
+            def fade_slice(i):
+                if i < len(factors):
+                    work_imp.getStack().getProcessor(i+1).multiply(factors[i])
+            ParallelUtils.parallel_for(fade_slice, work_imp.getStackSize())
+            self.log('{} fading correction applied with factors {}'.format(label, factors))
 
         masked_target = work_imp.duplicate()
         
         if params['background'] and params['background'] > 0:
-            IJ.run(work_imp, 'Subtract Background...', self._format_args('rolling={}'.format(params['background']), work_imp))
+            def bkd_slice(i):
+                ip = work_imp.getStack().getProcessor(i+1)
+                BackgroundSubtracter().rollingBallBackground(ip, float(params['background']), False, False, False, True, True)
+            ParallelUtils.parallel_for(bkd_slice, work_imp.getStackSize())
             
         mask_imp = None
         min_pixels, max_pixels = self._size_bounds_in_pixels(params['size_low'], params['size_high'], cal)
         
-        self.log("DEBUG: {} Calibration: {}x{} {}".format(label, cal.pixelWidth, cal.pixelHeight, cal.getUnit()))
-        self.log("DEBUG: {} Size bounds (px): {}-{}".format(label, min_pixels, max_pixels))
+        # self.log("DEBUG: {} Calibration: {}x{} {}".format(label, cal.pixelWidth, cal.pixelHeight, cal.getUnit()))
+        # self.log("DEBUG: {} Size bounds (px): {}-{}".format(label, min_pixels, max_pixels))
         
         if params['use_maxima']:
             segmented_imp = self.segment_dense_image(work_imp, params['noise'], params['min'])
-            self.log("DEBUG: {} segmented_imp slices: {}".format(label, segmented_imp.getStackSize()))
-            
-            # Manual stack processing for mask generation
-            mask_stack = ImageStack(segmented_imp.getWidth(), segmented_imp.getHeight())
+            # self.log("DEBUG: {} segmented_imp slices: {}".format(label, segmented_imp.getStackSize()))
             
             # Ensure we process in pixel units for the mask generation too
             seg_cal = segmented_imp.getCalibration().copy()
@@ -711,25 +737,31 @@ class SynapseJ4ChannelComplete(object):
             pixel_cal.pixelDepth = 1.0
             segmented_imp.setCalibration(pixel_cal)
             
-            for i in range(1, segmented_imp.getStackSize() + 1):
-                segmented_imp.setSlice(i)
-                IJ.setAutoThreshold(segmented_imp, 'Default dark')
+            def process_maxima_mask(i):
+                slice_idx = i + 1
+                ip = segmented_imp.getStack().getProcessor(slice_idx)
+                ip.setThreshold(1, 255, ImageProcessor.NO_LUT_UPDATE)
                 
                 pa = ParticleAnalyzer(ParticleAnalyzer.SHOW_MASKS, 0, ResultsTable(), min_pixels, max_pixels)
                 pa.setHideOutputImage(True)
-                pa.analyze(segmented_imp)
+                temp_imp = ImagePlus("temp", ip)
+                temp_imp.setCalibration(pixel_cal)
+                pa.analyze(temp_imp)
                 m = pa.getOutputImage()
                 if m:
-                    mask_stack.addSlice(m.getProcessor())
+                    return m.getProcessor()
                 else:
-                    mask_stack.addSlice(ByteProcessor(segmented_imp.getWidth(), segmented_imp.getHeight()))
+                    return ByteProcessor(segmented_imp.getWidth(), segmented_imp.getHeight())
+
+            mask_procs = ParallelUtils.parallel_for(process_maxima_mask, segmented_imp.getStackSize())
+            mask_stack = ImageStack(segmented_imp.getWidth(), segmented_imp.getHeight())
+            for p in mask_procs:
+                mask_stack.addSlice(p)
             
             mask_imp = ImagePlus("Mask", mask_stack)
-            mask_imp.setCalibration(seg_cal) # Restore original calibration for the mask? Or keep pixels? 
-            # The macro does "Multiply 257", "Invert", then "Subtract create".
-            # ImageCalculator uses pixel values, calibration doesn't matter for subtraction.
+            mask_imp.setCalibration(seg_cal) 
             
-            self.log("DEBUG: {} mask_imp (from maxima) slices: {}".format(label, mask_imp.getStackSize()))
+            # self.log("DEBUG: {} mask_imp (from maxima) slices: {}".format(label, mask_imp.getStackSize()))
             segmented_imp.close()
         else:
             temp_imp = work_imp.duplicate()
@@ -743,28 +775,37 @@ class SynapseJ4ChannelComplete(object):
             pixel_cal.pixelDepth = 1.0
             temp_imp.setCalibration(pixel_cal)
             
-            # Manual stack processing for mask generation
-            mask_stack = ImageStack(temp_imp.getWidth(), temp_imp.getHeight())
-            for i in range(1, temp_imp.getStackSize() + 1):
-                temp_imp.setSlice(i)
+            def process_thresh_mask(i):
+                slice_idx = i + 1
+                ip = temp_imp.getStack().getProcessor(slice_idx)
                 if params['min'] > 0:
-                    IJ.setThreshold(temp_imp, params['min'], 65535)
+                    ip.setThreshold(params['min'], 65535, ImageProcessor.NO_LUT_UPDATE)
                 else:
-                    IJ.setAutoThreshold(temp_imp, 'Default dark')
+                    hist = ip.getHistogram()
+                    threshold = AutoThresholder().getThreshold(AutoThresholder.Method.Default, hist)
+                    ip.setThreshold(threshold, 65535, ImageProcessor.NO_LUT_UPDATE)
+                
+                t_imp = ImagePlus("temp", ip)
+                t_imp.setCalibration(pixel_cal)
                 
                 pa = ParticleAnalyzer(ParticleAnalyzer.SHOW_MASKS, 0, ResultsTable(), min_pixels, max_pixels)
                 pa.setHideOutputImage(True)
-                pa.analyze(temp_imp)
+                pa.analyze(t_imp)
                 m = pa.getOutputImage()
                 if m:
-                    mask_stack.addSlice(m.getProcessor())
+                    return m.getProcessor()
                 else:
-                    mask_stack.addSlice(ByteProcessor(temp_imp.getWidth(), temp_imp.getHeight()))
+                    return ByteProcessor(temp_imp.getWidth(), temp_imp.getHeight())
+
+            mask_procs = ParallelUtils.parallel_for(process_thresh_mask, temp_imp.getStackSize())
+            mask_stack = ImageStack(temp_imp.getWidth(), temp_imp.getHeight())
+            for p in mask_procs:
+                mask_stack.addSlice(p)
             
             mask_imp = ImagePlus("Mask", mask_stack)
             mask_imp.setCalibration(temp_cal)
             
-            self.log("DEBUG: {} mask_imp (from threshold) slices: {}".format(label, mask_imp.getStackSize()))
+            # self.log("DEBUG: {} mask_imp (from threshold) slices: {}".format(label, mask_imp.getStackSize()))
             temp_imp.close()
 
         if mask_imp is None:
@@ -772,17 +813,23 @@ class SynapseJ4ChannelComplete(object):
             return [], work_imp, None
 
         ImageConverter(mask_imp).convertToGray16()
-        IJ.run(mask_imp, "Multiply...", "value=257 stack")
-        IJ.run(mask_imp, "Invert", "stack")
+        
+        def mult_invert_slice(i):
+            ip = mask_imp.getStack().getProcessor(i+1)
+            ip.multiply(257)
+            ip.invert()
+        ParallelUtils.parallel_for(mult_invert_slice, mask_imp.getStackSize())
         
         if self.dilate_enabled:
             self._dilate_mask(mask_imp, self.dilate_pixels)
         
         ic = ImageCalculator()
         result_imp = ic.run("Subtract create stack", masked_target, mask_imp)
-        self.log("DEBUG: {} result_imp (after subtract) slices: {}".format(label, result_imp.getStackSize()))
+        # self.log("DEBUG: {} result_imp (after subtract) slices: {}".format(label, result_imp.getStackSize()))
         
-        IJ.run(mask_imp, "Invert", "stack")
+        def invert_slice(i):
+            mask_imp.getStack().getProcessor(i+1).invert()
+        ParallelUtils.parallel_for(invert_slice, mask_imp.getStackSize())
         
         # Final ROI detection: headless, RoiManager-free replication of
         # "Analyze Particles... show=Nothing display clear summarize add stack".
@@ -790,31 +837,27 @@ class SynapseJ4ChannelComplete(object):
         from ij.process import ImageProcessor as _IP
 
         n_slices = result_imp.getStackSize()
-        self.log("DEBUG: {} final detection on {} slice(s) via custom labeling".format(label, n_slices))
-
-        entries = []
-        roi_index = 0
+        # self.log("DEBUG: {} final detection on {} slice(s) via custom labeling".format(label, n_slices))
 
         stack = result_imp.getStack()
 
-        for s in range(1, n_slices + 1):
-            result_imp.setSlice(s)
-            ip = stack.getProcessor(s)
+        def process_final_slice(i):
+            slice_idx = i + 1
+            ip = stack.getProcessor(slice_idx)
 
-            # Determine threshold range exactly as the macro does:
-            # - If a minimum is provided, use it as the lower bound.
-            # - Otherwise, use ImageJ's "Default" auto-threshold on this slice.
             if params['min'] > 0:
                 lower = float(params['min'])
                 upper = 65535.0
                 ip.setThreshold(lower, upper, _IP.NO_LUT_UPDATE)
             else:
-                IJ.setAutoThreshold(result_imp, 'Default dark')
+                hist = ip.getHistogram()
+                threshold = AutoThresholder().getThreshold(AutoThresholder.Method.Default, hist)
+                ip.setThreshold(threshold, 65535.0, _IP.NO_LUT_UPDATE)
                 lower = ip.getMinThreshold()
                 upper = ip.getMaxThreshold()
 
             if lower == _IP.NO_THRESHOLD or upper == _IP.NO_THRESHOLD:
-                continue
+                return []
 
             width = ip.getWidth()
             height = ip.getHeight()
@@ -836,6 +879,7 @@ class SynapseJ4ChannelComplete(object):
                             continue
                         yield nx, ny
 
+            slice_entries = []
             # Scan all pixels, flood-fill suprathreshold regions
             for y in range(height):
                 for x in range(width):
@@ -874,26 +918,37 @@ class SynapseJ4ChannelComplete(object):
                     comp_imp = ImagePlus('comp', comp_bp)
                     comp_ip = comp_imp.getProcessor()
                     comp_ip.setThreshold(255, 255, _IP.NO_LUT_UPDATE)
-                    IJ.run(comp_imp, 'Create Selection', '')
-                    roi = comp_imp.getRoi()
+                    roi = ThresholdToSelection.run(comp_imp)
                     comp_imp.close()
 
                     if roi is None:
                         continue
 
-                    roi.setPosition(s)
+                    roi.setPosition(slice_idx)
 
-                    # Measure on the calibrated result image to keep physical units.
-                    result_imp.setSlice(s)
-                    result_imp.setRoi(roi)
-                    stats = result_imp.getStatistics(MEASUREMENT_FLAGS)
-                    metrics = self._metrics_dict(base_name, label, roi_index, stats, cal, roi)
-                    entries.append({'roi': roi, 'metrics': metrics})
-                    roi_index += 1
+                    meas_imp = ImagePlus("meas", ip)
+                    meas_imp.setCalibration(cal)
+                    meas_imp.setRoi(roi)
+                    stats = meas_imp.getStatistics(MEASUREMENT_FLAGS)
+                    
+                    metrics = self._metrics_dict(base_name, label, 0, stats, cal, roi)
+                    slice_entries.append({'roi': roi, 'metrics': metrics})
+            return slice_entries
 
-            result_imp.deleteRoi()
+        nested_entries = ParallelUtils.parallel_for(process_final_slice, n_slices)
+        
+        entries = []
+        roi_index = 0
+        for slice_entries in nested_entries:
+            for entry in slice_entries:
+                entry['metrics']['Label'] = '{}:{}:{}'.format(base_name, label, roi_index)
+                entry['metrics']['Index'] = roi_index
+                entries.append(entry)
+                roi_index += 1
 
-        self.log("DEBUG: {} Total ROIs from custom labeling: {}".format(label, len(entries)))
+        result_imp.deleteRoi()
+
+        # self.log("DEBUG: {} Total ROIs from custom labeling: {}".format(label, len(entries)))
         return entries, result_imp, mask_imp
 
     def _metrics_dict(self, base_name, label, index, stats, cal, roi):
@@ -1154,9 +1209,9 @@ class SynapseJ4ChannelComplete(object):
 
             check_imp.deleteRoi()
             kept_rois.reverse()
-            self.log("DEBUG: assoc_roi (LapNo=1) processed {} ROIs".format(len(rois)))
-            for s in sorted(slice_total_counts.keys()):
-                self.log("DEBUG: assoc_roi Slice {}: Kept {}/{}".format(s, slice_kept_counts[s], slice_total_counts[s]))
+            # self.log("DEBUG: assoc_roi (LapNo=1) processed {} ROIs".format(len(rois)))
+            # for s in sorted(slice_total_counts.keys()):
+                # self.log("DEBUG: assoc_roi Slice {}: Kept {}/{}".format(s, slice_kept_counts[s], slice_total_counts[s]))
             return kept_rois
 
         # LapNo > 1 branch: require explicit pixel overlap using a Count Masks image.
@@ -1166,7 +1221,7 @@ class SynapseJ4ChannelComplete(object):
             return rois
 
         stats_mask = count_mask.getStatistics()
-        self.log("DEBUG: Count Mask Max: {}".format(stats_mask.max))
+        # self.log("DEBUG: Count Mask Max: {}".format(stats_mask.max))
 
         for roi in reversed(rois):
             slice_idx = roi.getPosition()
@@ -1196,9 +1251,9 @@ class SynapseJ4ChannelComplete(object):
         count_mask.close()
         kept_rois.reverse()
 
-        self.log("DEBUG: assoc_roi (LapNo>{}) processed {} ROIs".format(1, len(rois)))
-        for s in sorted(slice_total_counts.keys()):
-            self.log("DEBUG: assoc_roi Slice {}: Kept {}/{}".format(s, slice_kept_counts[s], slice_total_counts[s]))
+        # self.log("DEBUG: assoc_roi (LapNo>{}) processed {} ROIs".format(1, len(rois)))
+        # for s in sorted(slice_total_counts.keys()):
+            # self.log("DEBUG: assoc_roi Slice {}: Kept {}/{}".format(s, slice_kept_counts[s], slice_total_counts[s]))
         return kept_rois
 
     def _clear_roi(self, imp1, imp2, roi):
@@ -1235,21 +1290,27 @@ class SynapseJ4ChannelComplete(object):
         stack = mask_imp.getStack()
         n_slices = stack.getSize()
         
-        for i in range(1, n_slices + 1):
-            mask_imp.setSlice(i)
-            IJ.setAutoThreshold(mask_imp, 'Default dark')
-            IJ.run(mask_imp, "Create Selection", "")
+        def process_slice(i):
+            slice_idx = i + 1
+            ip = stack.getProcessor(slice_idx)
+            # Threshold > 0 (binary mask usually 0 and 255)
+            ip.setThreshold(1, 255, ImageProcessor.NO_LUT_UPDATE)
+            temp_imp = ImagePlus("temp", ip)
+            roi = ThresholdToSelection.run(temp_imp)
             
-            roi = mask_imp.getRoi()
             if roi:
-                from ij.plugin import RoiEnlarger
-                dilated_roi = RoiEnlarger.enlarge(roi, float(pixels))  # can be 0 or negative
-                mask_imp.setRoi(dilated_roi)
-                IJ.run(mask_imp, "Set...", "value=255 slice")
-                mask_imp.deleteRoi()
+                dilated_roi = RoiEnlarger.enlarge(roi, float(pixels))
+                ip.setValue(255)
+                ip.fill(dilated_roi)
+        
+        ParallelUtils.parallel_for(process_slice, n_slices)
                 
         ImageConverter(mask_imp).convertToGray16()
-        IJ.run(mask_imp, "Multiply...", "value=257 stack")
+        
+        def multiply_slice(i):
+            stack.getProcessor(i+1).multiply(257)
+            
+        ParallelUtils.parallel_for(multiply_slice, n_slices)
 
     def _create_label_map(self, imp, rois, pixels):
         """Create a label map image where pixel values correspond to ROI indices (1-based)."""
@@ -1425,14 +1486,62 @@ class SynapseJ4ChannelComplete(object):
 
         self.log("{} gating (intensity only): {}/{} retained (Max>{}, Min>{}, size param={})".format(
             label, len(kept), len(entries), hi_val, lo_val, size_val))
-        for s in sorted(slice_total_counts.keys()):
-            self.log("DEBUG: {} gating Slice {}: Kept {}/{}".format(label, s, slice_kept_counts[s], slice_total_counts[s]))
+        # for s in sorted(slice_total_counts.keys()):
+            # self.log("DEBUG: {} gating Slice {}: Kept {}/{}".format(label, s, slice_kept_counts[s], slice_total_counts[s]))
 
         if marker_rows:
             out_path = os.path.join(self.excel_dir, base_name + excel_suffix)
             self.save_results_table(marker_rows, out_path)
 
         return kept
+
+
+from java.util.concurrent import Executors, Callable, Future, TimeUnit
+from java.util import ArrayList
+
+class ParallelUtils(object):
+    _executor = None
+
+    @classmethod
+    def get_executor(cls):
+        if cls._executor is None:
+            cls._executor = Executors.newFixedThreadPool(8) # Adjust based on CPU
+        return cls._executor
+
+    @classmethod
+    def run_tasks(cls, tasks):
+        """Run a list of no-arg functions (callables) in parallel."""
+        executor = cls.get_executor()
+        
+        # Wrap python functions in Java Callable
+        class PyCallable(Callable):
+            def __init__(self, func):
+                self.func = func
+            def call(self):
+                return self.func()
+        
+        java_tasks = ArrayList()
+        for t in tasks:
+            java_tasks.add(PyCallable(t))
+            
+        futures = executor.invokeAll(java_tasks)
+        results = []
+        for f in futures:
+            results.append(f.get())
+        return results
+
+    @classmethod
+    def parallel_for(cls, func, n_items):
+        """Run func(i) for i in range(n_items) in parallel."""
+        tasks = []
+        for i in range(n_items):
+            tasks.append(lambda idx=i: func(idx))
+        return cls.run_tasks(tasks)
+
+    @classmethod
+    def shutdown(cls):
+        if cls._executor is not None:
+            cls._executor.shutdown()
 
 
 if __name__ == '__main__':
@@ -1444,7 +1553,11 @@ if __name__ == '__main__':
 
     if not config_path:
         print('Usage: SYNAPSEJ_CONFIG=path/to/config fiji --headless --run Pynapse.py')
-        sys.exit(1)
+        System.exit(1)
 
-    analyzer = SynapseJ4ChannelComplete(config_path)
-    analyzer.process_directory()
+    try:
+        analyzer = SynapseJ4ChannelComplete(config_path)
+        analyzer.process_directory()
+    finally:
+        ParallelUtils.shutdown()
+        System.exit(0)
