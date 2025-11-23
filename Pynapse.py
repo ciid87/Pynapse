@@ -7,7 +7,7 @@ import os
 import sys
 import math
 import csv
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from datetime import datetime
 from ij import Prefs
 # Prefs.set("headless", "true")                     # ← forces headless mode in IJ1
@@ -25,7 +25,7 @@ from ij.io import FileSaver, RoiEncoder
 from java.io import FileOutputStream, BufferedOutputStream
 from java.util.zip import ZipOutputStream, ZipEntry
 from java.lang import Double, Throwable, System
-from java.awt import Color
+from java.awt import Color, Font
 Prefs.blackBackground = True
 Analyzer.setPrecision(3)
 MEASUREMENT_FLAGS = Measurements.AREA | Measurements.MEAN | Measurements.MIN_MAX | \
@@ -520,7 +520,7 @@ class SynapseJ4ChannelComplete(object):
         self.log('  Pre detections (gated): {}'.format(len(pre_entries)))
         self.log('  Post detections (gated): {}'.format(len(post_entries)))
 
-        if imp.getCalibration().pixelWidth == 1.0 and imp.getInfoProperty("Resolution") != None:
+        if imp.getCalibration().pixelWidth == 1.0 and imp.getProperty("Resolution") != None:
             # Attempt to parse resolution if available, similar to macro's getScaleAndUnit behavior
             pass 
 
@@ -576,6 +576,12 @@ class SynapseJ4ChannelComplete(object):
         c1_imp = channels[0] # C1
         c2_imp = channels[1] # C2
         self.save_overlay(pre_result_imp, post_result_imp, c1_imp, c2_imp, name_short)
+
+        # Save Paper-Style Synapse Figures (Colocalized puncta only)
+        self.save_synapse_figures(name_short, pre_result_imp, post_result_imp, syn_pre_rois, syn_post_rois, c1_imp, c2_imp)
+
+        # Generate Presentation Outputs
+        self.generate_presentation_outputs(name_short, pre_entries, post_entries, syn_pre_rois, syn_post_rois, cal, pre_result_imp, post_result_imp, c1_imp, c2_imp)
 
         # Collated ResultsIF row (macro LABEL, Syn, SynPre, ThrPre, ForPost, Post, Pre).
         self.record_summary(
@@ -1494,6 +1500,300 @@ class SynapseJ4ChannelComplete(object):
             self.save_results_table(marker_rows, out_path)
 
         return kept
+
+    def _create_synapse_image(self, source_imp, rois, title):
+        """Create a new image containing only the pixels within the provided ROIs."""
+        width = source_imp.getWidth()
+        height = source_imp.getHeight()
+        stack_size = source_imp.getStackSize()
+        src_stack = source_imp.getStack()
+        
+        # Create new stack of same dimensions
+        new_stack = ImageStack(width, height)
+        for i in range(1, stack_size + 1):
+            ip = src_stack.getProcessor(i)
+            # Create empty processor of same type (Byte, Short, Float)
+            new_ip = ip.createProcessor(width, height) 
+            # Ensure it's black/zeroed
+            new_ip.setValue(0)
+            new_ip.fill()
+            new_stack.addSlice(str(i), new_ip)
+            
+        if rois:
+            for roi in rois:
+                slice_idx = roi.getPosition()
+                if slice_idx < 1: slice_idx = 1
+                if slice_idx > stack_size: continue
+                
+                src_ip = src_stack.getProcessor(slice_idx)
+                dst_ip = new_stack.getProcessor(slice_idx)
+                
+                # Extract ROI content
+                src_ip.setRoi(roi)
+                cropped = src_ip.crop()
+                
+                # Paste into destination using COPY_TRANSPARENT to avoid overwriting with bounding box background
+                bounds = roi.getBounds()
+                dst_ip.copyBits(cropped, bounds.x, bounds.y, Blitter.COPY_TRANSPARENT)
+            
+        new_imp = ImagePlus(title, new_stack)
+        new_imp.setCalibration(source_imp.getCalibration())
+        return new_imp
+
+    def generate_presentation_outputs(self, base_name, pre_entries, post_entries, syn_pre_rois, syn_post_rois, cal, pre_result_imp, post_result_imp, c1_imp, c2_imp):
+        """Generate user-friendly presentation outputs in a 'present' subfolder."""
+        present_dir = os.path.join(self.dest_dir, 'present')
+        if not os.path.exists(present_dir):
+            os.makedirs(present_dir)
+
+        # --- 1. Data Table ---
+        syn_pre_set = set(syn_pre_rois)
+        syn_post_set = set(syn_post_rois)
+        
+        # Helper to calculate overlap
+        def get_overlap_stats(roi, target_imp, threshold=0):
+            if target_imp.getStackSize() > 1:
+                target_imp.setSlice(roi.getPosition())
+            target_imp.setRoi(roi)
+            stats = target_imp.getStatistics()
+            
+            # Count pixels > threshold
+            # If threshold is 0, we count non-zero pixels.
+            # If target_imp is raw intensity, we need a meaningful threshold.
+            # For result_imp (processed), >0 is correct.
+            
+            # Using histogram for efficiency if 8-bit or 16-bit
+            hist = target_imp.getProcessor().getHistogram()
+            overlap_px = 0
+            
+            # If threshold is 0, sum all bins from 1 to end
+            start_bin = int(threshold) + 1
+            if start_bin < len(hist):
+                overlap_px = sum(hist[start_bin:])
+                
+            pixel_area = self._pixel_area(cal)
+            overlap_area = overlap_px * pixel_area
+            
+            # ROI Area in pixels
+            roi_px = 0
+            if hasattr(stats, 'pixelCount'):
+                roi_px = stats.pixelCount
+            else:
+                # Fallback
+                roi_px = sum(hist) # Total pixels in ROI
+                
+            percent = (float(overlap_px) / float(roi_px) * 100.0) if roi_px > 0 else 0.0
+            return overlap_px, overlap_area, percent
+
+        report_rows = []
+        
+        # Process Pre
+        for entry in pre_entries:
+            roi = entry['roi']
+            metrics = entry['metrics']
+            is_synaptic = roi in syn_pre_set
+            
+            # Overlap with Post (Synaptic Match)
+            # Use post_result_imp (processed channel)
+            ov_px, ov_area, ov_pct = get_overlap_stats(roi, post_result_imp, 0)
+            
+            # Overlap with Pre Marker (C2/Gray)
+            # Use c2_imp (raw) with pre_marker_min threshold
+            marker_ov_px, marker_ov_area, marker_ov_pct = 0, 0, 0
+            if self.pre_marker_thresholds:
+                marker_ov_px, marker_ov_area, marker_ov_pct = get_overlap_stats(roi, c2_imp, self.pre_marker_thresholds['min'])
+            
+            row = OrderedDict([
+                ('Image Name', base_name),
+                ('Puncta ID', metrics['Label']),
+                ('Channel', 'Presynaptic'),
+                ('Type', 'Synaptic' if is_synaptic else 'Isolated'),
+                ('X (um)', "{:.3f}".format(metrics['X'])),
+                ('Y (um)', "{:.3f}".format(metrics['Y'])),
+                ('Z (Slice)', roi.getPosition()),
+                ('Puncta Area (um^2)', "{:.3f}".format(metrics['Area'])),
+                ('Mean Intensity', "{:.1f}".format(metrics['Mean'])),
+                ('Min Intensity', "{:.1f}".format(metrics['Min'])),
+                ('Max Intensity', "{:.1f}".format(metrics['Max'])),
+                ('Integrated Density', "{:.1f}".format(metrics['IntDen'])),
+                ('Raw Integrated Density', "{:.1f}".format(metrics['RawIntDen'])),
+                ('Center of Mass X (um)', "{:.3f}".format(metrics['XM'])),
+                ('Center of Mass Y (um)', "{:.3f}".format(metrics['YM'])),
+                ('Perimeter (um)', "{:.3f}".format(metrics['Perim.'])),
+                ('Feret Diameter (um)', "{:.3f}".format(metrics['Feret'])),
+                ('Feret X (um)', "{:.3f}".format(metrics['FeretX'])),
+                ('Feret Y (um)', "{:.3f}".format(metrics['FeretY'])),
+                ('Feret Angle (deg)', "{:.1f}".format(metrics['FeretAngle'])),
+                ('Min Feret (um)', "{:.3f}".format(metrics['MinFeret'])),
+                ('Synaptic Overlap (px)', int(ov_px)),
+                ('Synaptic Overlap (um^2)', "{:.3f}".format(ov_area)),
+                ('Synaptic Overlap %', "{:.1f}".format(ov_pct)),
+                ('Marker Overlap (px)', int(marker_ov_px)),
+                ('Marker Overlap %', "{:.1f}".format(marker_ov_pct))
+            ])
+            report_rows.append(row)
+            
+        # Process Post
+        for entry in post_entries:
+            roi = entry['roi']
+            metrics = entry['metrics']
+            is_synaptic = roi in syn_post_set
+            
+            # Overlap with Pre (Synaptic Match)
+            # Use pre_result_imp (processed channel)
+            ov_px, ov_area, ov_pct = get_overlap_stats(roi, pre_result_imp, 0)
+            
+            # Overlap with Post Marker (C1/Blue)
+            # Use c1_imp (raw) with post_marker_min threshold
+            marker_ov_px, marker_ov_area, marker_ov_pct = 0, 0, 0
+            if self.post_marker_thresholds:
+                marker_ov_px, marker_ov_area, marker_ov_pct = get_overlap_stats(roi, c1_imp, self.post_marker_thresholds['min'])
+            
+            row = OrderedDict([
+                ('Image Name', base_name),
+                ('Puncta ID', metrics['Label']),
+                ('Channel', 'Postsynaptic'),
+                ('Type', 'Synaptic' if is_synaptic else 'Isolated'),
+                ('X (um)', "{:.3f}".format(metrics['X'])),
+                ('Y (um)', "{:.3f}".format(metrics['Y'])),
+                ('Z (Slice)', roi.getPosition()),
+                ('Puncta Area (um^2)', "{:.3f}".format(metrics['Area'])),
+                ('Mean Intensity', "{:.1f}".format(metrics['Mean'])),
+                ('Min Intensity', "{:.1f}".format(metrics['Min'])),
+                ('Max Intensity', "{:.1f}".format(metrics['Max'])),
+                ('Integrated Density', "{:.1f}".format(metrics['IntDen'])),
+                ('Raw Integrated Density', "{:.1f}".format(metrics['RawIntDen'])),
+                ('Center of Mass X (um)', "{:.3f}".format(metrics['XM'])),
+                ('Center of Mass Y (um)', "{:.3f}".format(metrics['YM'])),
+                ('Perimeter (um)', "{:.3f}".format(metrics['Perim.'])),
+                ('Feret Diameter (um)', "{:.3f}".format(metrics['Feret'])),
+                ('Feret X (um)', "{:.3f}".format(metrics['FeretX'])),
+                ('Feret Y (um)', "{:.3f}".format(metrics['FeretY'])),
+                ('Feret Angle (deg)', "{:.1f}".format(metrics['FeretAngle'])),
+                ('Min Feret (um)', "{:.3f}".format(metrics['MinFeret'])),
+                ('Synaptic Overlap (px)', int(ov_px)),
+                ('Synaptic Overlap (um^2)', "{:.3f}".format(ov_area)),
+                ('Synaptic Overlap %', "{:.1f}".format(ov_pct)),
+                ('Marker Overlap (px)', int(marker_ov_px)),
+                ('Marker Overlap %', "{:.1f}".format(marker_ov_pct))
+            ])
+            report_rows.append(row)
+            
+        table_path = os.path.join(present_dir, "{}_Presentation_Report.csv".format(base_name))
+        self.save_results_table(report_rows, table_path)
+        
+        # --- 2. Overlap Image (Intersection Mask) ---
+        width = pre_result_imp.getWidth()
+        height = pre_result_imp.getHeight()
+        stack_size = pre_result_imp.getStackSize()
+        
+        overlap_stack = ImageStack(width, height)
+        
+        for i in range(1, stack_size + 1):
+            # Create Pre Mask
+            pre_ip = ByteProcessor(width, height)
+            for roi in syn_pre_rois:
+                if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
+                    pre_ip.setValue(255)
+                    pre_ip.fill(roi)
+            
+            # Create Post Mask
+            post_ip = ByteProcessor(width, height)
+            for roi in syn_post_rois:
+                if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
+                    post_ip.setValue(255)
+                    post_ip.fill(roi)
+            
+            # Intersect
+            pre_ip.copyBits(post_ip, 0, 0, Blitter.AND)
+            overlap_stack.addSlice(str(i), pre_ip)
+            
+        overlap_imp = ImagePlus(base_name + "_Overlap", overlap_stack)
+        overlap_imp.setCalibration(cal)
+        IJ.save(overlap_imp, os.path.join(present_dir, "{}_Overlap_Mask.tif".format(base_name)))
+        overlap_imp.close()
+        
+        # --- 3. Annotated Map (Schematic) ---
+        # Create RGB Stack
+        map_stack = ImageStack(width, height)
+        font = Font("SansSerif", Font.PLAIN, 10)
+        
+        for i in range(1, stack_size + 1):
+            # Create blank RGB
+            cp = ByteProcessor(width, height) # Black background
+            rgb_ip = cp.convertToRGB() 
+            rgb_ip.setFont(font)
+            
+            # Draw Isolated Pre (Dark Green)
+            rgb_ip.setColor(Color(0, 100, 0))
+            for entry in pre_entries:
+                roi = entry['roi']
+                if roi not in syn_pre_set:
+                    if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
+                        rgb_ip.draw(roi)
+                        
+            # Draw Isolated Post (Dark Red)
+            rgb_ip.setColor(Color(100, 0, 0))
+            for entry in post_entries:
+                roi = entry['roi']
+                if roi not in syn_post_set:
+                    if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
+                        rgb_ip.draw(roi)
+
+            # Draw Synaptic Pre (Bright Green)
+            rgb_ip.setColor(Color.GREEN)
+            for roi in syn_pre_rois:
+                if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
+                    rgb_ip.draw(roi)
+                    
+            # Draw Synaptic Post (Bright Red)
+            rgb_ip.setColor(Color.RED)
+            for roi in syn_post_rois:
+                if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
+                    rgb_ip.draw(roi)
+            
+            # Draw Labels (White)
+            rgb_ip.setColor(Color.WHITE)
+            # Label Synaptic Pre
+            for idx, roi in enumerate(syn_pre_rois):
+                if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
+                    bounds = roi.getBounds()
+                    rgb_ip.drawString("P:{}".format(idx+1), bounds.x, bounds.y)
+            
+            map_stack.addSlice(str(i), rgb_ip)
+            
+        map_imp = ImagePlus(base_name + "_Annotated_Map", map_stack)
+        map_imp.setCalibration(cal)
+        IJ.save(map_imp, os.path.join(present_dir, "{}_Annotated_Map.tif".format(base_name)))
+        map_imp.close()
+
+    def save_synapse_figures(self, base_name, pre_result_imp, post_result_imp, syn_pre_rois, syn_post_rois, c1_imp, c2_imp):
+        """Generate paper-style figures showing only colocalized synaptic puncta."""
+        pre_syn_imp = self._create_synapse_image(pre_result_imp, syn_pre_rois, base_name + "PreSyn")
+        post_syn_imp = self._create_synapse_image(post_result_imp, syn_post_rois, base_name + "PostSyn")
+        
+        # Save individual channels for debugging
+        IJ.save(pre_syn_imp, os.path.join(self.dest_dir, base_name + "PreSyn.tif"))
+        IJ.save(post_syn_imp, os.path.join(self.dest_dir, base_name + "PostSyn.tif"))
+        
+        # Create Merge: Red=Post, Green=Pre (matching paper convention)
+        # Also include original marker channels: Blue=C1 (Post Marker), Gray=C2 (Pre Marker)
+        c1 = post_syn_imp # Red
+        c2 = pre_syn_imp  # Green
+        c3 = c1_imp.duplicate() # Blue
+        c4 = c2_imp.duplicate() # Gray
+        
+        merged = RGBStackMerge.mergeChannels([c1, c2, c3, c4], True)
+        
+        if merged is not None:
+            out_path = os.path.join(self.dest_dir, base_name + "SynapseMerge.tif")
+            IJ.save(merged, out_path)
+            merged.close()
+        
+        pre_syn_imp.close()
+        post_syn_imp.close()
+        c3.close()
+        c4.close()
 
 
 from java.util.concurrent import Executors, Callable, Future, TimeUnit
