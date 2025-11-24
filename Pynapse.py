@@ -1,6 +1,15 @@
-#!/usr/bin/env jython
+# -*- coding: utf-8 -*-
 """
 Pynapse.py - Repaired Headless Fiji/Jython recreation of SynapseJ macro v1.
+
+REFERENCE:
+Moreno-Manrique, M., et al. (2021). SynapseJ: An ImageJ plugin for the automated 
+detection of synapses. bioRxiv.
+
+This script implements the image processing pipeline described in the SynapseJ paper
+for the automated detection and quantification of synapses in immunofluorescence images.
+It replicates the logic of the original ImageJ macro (SynapseJ_v_1.ijm) but is 
+adapted for headless execution in a cluster environment using Jython.
 """
 
 import os
@@ -9,86 +18,281 @@ import math
 import csv
 from collections import defaultdict, OrderedDict
 from datetime import datetime
-from ij import Prefs
-# Prefs.set("headless", "true")                     # ← forces headless mode in IJ1
-from ij.macro import Interpreter
-Interpreter.setAdditionalFunctions("function waitForUser() {} function showMessage() {} function showMessageWithCancel() {} function Dialog.create() { return null; }")
 
-from ij import Prefs, IJ, ImagePlus, ImageStack, ImageStack, WindowManager
-from ij.plugin import ChannelSplitter, RGBStackMerge
-from ij.process import ByteProcessor, ShortProcessor, FloatProcessor, ImageStatistics, ImageProcessor, ImageConverter, Blitter
-from ij.measure import ResultsTable, Measurements, Calibration
-from ij.plugin.filter import ParticleAnalyzer, GaussianBlur, Analyzer, BackgroundSubtracter, MaximumFinder, ThresholdToSelection, RankFilters
-from ij.plugin import RoiEnlarger, ImageCalculator
-from ij.plugin.frame import RoiManager
-from ij.io import FileSaver, RoiEncoder
-from java.io import FileOutputStream, BufferedOutputStream
-from java.util.zip import ZipOutputStream, ZipEntry
-from java.lang import Double, Throwable, System
-from java.awt import Color, Font
-Prefs.blackBackground = True
-Analyzer.setPrecision(3)
-MEASUREMENT_FLAGS = Measurements.AREA | Measurements.MEAN | Measurements.MIN_MAX | \
-                    Measurements.CENTROID | Measurements.CENTER_OF_MASS | \
-                    Measurements.PERIMETER | Measurements.FERET | Measurements.INTEGRATED_DENSITY | \
-                    Measurements.LIMIT
-# Raw Integrated Density might not be in Measurements interface in some versions
-try:
-    MEASUREMENT_FLAGS |= Measurements.RAW_INTEGRATED_DENSITY
-except AttributeError:
-    pass # Or define it manually if needed: MEASUREMENT_FLAGS |= 2097152
+# --- BOOTSTRAP LOGIC FOR CPYTHON ---
+def is_jython():
+    return sys.platform.startswith('java')
 
+if not is_jython():
+    # We are running in standard Python (CPython).
+    # We need to find Fiji and launch this script using it.
+    import subprocess
+    import shutil
+    
+    CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".pynapse_config")
+    
+    def get_fiji_path():
+        # Check config file
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                path = f.read().strip()
+                if os.path.exists(path):
+                    return path
+        
+        # Check common locations
+        common_paths = [
+            "Fiji.app/ImageJ-linux64", # Relative
+            "Fiji.app/ImageJ-win64.exe",
+            "Fiji.app/Contents/MacOS/ImageJ-macosx",
+            "fiji-linux-x64", # Relative (from user's previous setup)
+            "Fiji/fiji-linux-x64",
+            "/Applications/Fiji.app/Contents/MacOS/ImageJ-macosx"
+        ]
+        for p in common_paths:
+            if os.path.exists(p):
+                return os.path.abspath(p)
+                
+        return None
+
+    def setup_fiji():
+        print("Fiji not found. Setting up...")
+        # Download
+        if not os.path.exists("fiji-latest-linux64-jdk.zip"):
+            print("Downloading Fiji...")
+            subprocess.check_call(["wget", "https://downloads.imagej.net/fiji/latest/fiji-latest-linux64-jdk.zip"])
+        
+        # Unzip
+        if not os.path.exists("Fiji.app") and not os.path.exists("Fiji"):
+            print("Unzipping...")
+            subprocess.check_call(["unzip", "-q", "fiji-latest-linux64-jdk.zip"])
+            
+        # Locate binary after unzip
+        # The zip usually creates 'Fiji.app'
+        fiji_bin = None
+        if os.path.exists("Fiji.app/ImageJ-linux64"):
+            fiji_bin = os.path.abspath("Fiji.app/ImageJ-linux64")
+        elif os.path.exists("Fiji/fiji-linux-x64"): # User's specific structure
+             fiji_bin = os.path.abspath("Fiji/fiji-linux-x64")
+             
+        if not fiji_bin:
+             # Fallback search
+             for root, dirs, files in os.walk("."):
+                 if "ImageJ-linux64" in files:
+                     fiji_bin = os.path.abspath(os.path.join(root, "ImageJ-linux64"))
+                     break
+        
+        if fiji_bin:
+            print("Updating Fiji...")
+            subprocess.check_call([fiji_bin, "--update", "refresh-update-sites", "ImageJ"])
+            subprocess.check_call([fiji_bin, "--update", "update", "net.imagej:imagej-updater"])
+            return fiji_bin
+        else:
+            raise Exception("Could not locate Fiji binary after installation.")
+
+    fiji_path = get_fiji_path()
+    
+    if not fiji_path:
+        print("Fiji not found.")
+        try:
+            # Python 2/3 compatibility for input
+            input_func = raw_input
+        except NameError:
+            input_func = input
+            
+        choice = input_func("Do you want to (d)ownload and setup Fiji, or (p)rovide a path? [d/p]: ")
+        
+        if choice.lower().startswith('p'):
+            path = input_func("Enter path to Fiji executable: ")
+            if os.path.exists(path):
+                fiji_path = os.path.abspath(path)
+            else:
+                print("Invalid path.")
+                sys.exit(1)
+        else:
+            fiji_path = setup_fiji()
+            
+    # Save config
+    with open(CONFIG_FILE, 'w') as f:
+        f.write(fiji_path)
+        
+    print("Using Fiji at: {}".format(fiji_path))
+    
+    # Create a temporary launcher script to avoid parsing issues with large files in Jython
+    # This works around the "Mark invalid" / "encoding declaration" errors when running large scripts directly
+    import tempfile
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_name = os.path.basename(__file__)
+    module_name = os.path.splitext(script_name)[0]
+    
+    # We embed the current arguments into the launcher so the module sees them
+    launcher_content = """
+import sys
+import os
+
+# Add the script directory to path so we can import the module
+script_dir = r"{}"
+if script_dir not in sys.path:
+    sys.path.append(script_dir)
+
+import {} as Pynapse
+
+# Restore arguments
+sys.argv = {}
+
+# Run main
+Pynapse.main()
+""".format(script_dir, module_name, repr(sys.argv))
+
+    fd, launcher_path = tempfile.mkstemp(suffix=".py", text=True)
+    with os.fdopen(fd, 'w') as f:
+        f.write(launcher_content)
+    
+    # Re-launch with Fiji running the launcher
+    cmd = [fiji_path, "--headless", "--run", launcher_path]
+    
+    print("Launching via wrapper: " + " ".join(cmd))
+    sys.stdout.flush()
+    try:
+        subprocess.call(cmd)
+    finally:
+        if os.path.exists(launcher_path):
+            os.remove(launcher_path)
+            
+    sys.exit(0)
+
+# --- JYTHON IMPORTS (Only execute if running in Fiji) ---
+if is_jython():
+    # ImageJ/Fiji API Imports
+    # The script relies heavily on the ImageJ API (ij.*) to perform image processing tasks
+    # without a GUI. This includes opening images, manipulating stacks, and measuring particles.
+    from ij import Prefs
+    # Prefs.set("headless", "true")                     # Forces headless mode in IJ1, preventing GUI dialogs from blocking execution.
+    from ij.macro import Interpreter
+    # Mock UI functions to prevent the macro interpreter from hanging when it encounters 
+    # waitForUser or showMessage calls in legacy code or plugins.
+    Interpreter.setAdditionalFunctions("function waitForUser() {} function showMessage() {} function showMessageWithCancel() {} function Dialog.create() { return null; }")
+
+    from ij import Prefs, IJ, ImagePlus, ImageStack, ImageStack, WindowManager
+    from ij.plugin import ChannelSplitter, RGBStackMerge
+    from ij.process import ByteProcessor, ShortProcessor, FloatProcessor, ImageStatistics, ImageProcessor, ImageConverter, Blitter
+    from ij.measure import ResultsTable, Measurements, Calibration
+    from ij.plugin.filter import ParticleAnalyzer, GaussianBlur, Analyzer, BackgroundSubtracter, MaximumFinder, ThresholdToSelection, RankFilters
+    from ij.plugin import RoiEnlarger, ImageCalculator
+    from ij.plugin.frame import RoiManager
+    from ij.gui import ShapeRoi
+    from ij.io import FileSaver, RoiEncoder
+    from java.io import FileOutputStream, BufferedOutputStream
+    from java.util.zip import ZipOutputStream, ZipEntry
+    from java.lang import Double, Throwable, System
+    from java.awt import Color, Font
+
+    # Ensure black background for binary operations to match ImageJ default settings for fluorescence.
+    Prefs.blackBackground = True
+    # Set measurement precision to 3 decimal places as per standard ImageJ defaults.
+    Analyzer.setPrecision(3)
+
+    # MEASUREMENT_FLAGS: Defines the set of metrics to be calculated for each detected puncta.
+    # These flags correspond to the "Set Measurements" command in ImageJ.
+    # - AREA: Size of the puncta in calibrated units (e.g., µm²).
+    # - MEAN: Mean gray value intensity.
+    # - MIN_MAX: Minimum and maximum gray values.
+    # - CENTROID/CENTER_OF_MASS: Spatial coordinates of the puncta.
+    # - PERIMETER/FERET: Shape descriptors (Feret's diameter is the longest distance between any two points on the boundary).
+    # - INTEGRATED_DENSITY: Sum of the values of the pixels in the selection (Area * Mean).
+    # - LIMIT: Limit measurements to thresholded pixels.
+    MEASUREMENT_FLAGS = Measurements.AREA | Measurements.MEAN | Measurements.MIN_MAX | \
+                        Measurements.CENTROID | Measurements.CENTER_OF_MASS | \
+                        Measurements.PERIMETER | Measurements.FERET | Measurements.INTEGRATED_DENSITY | \
+                        Measurements.LIMIT
+
+    # Raw Integrated Density might not be in Measurements interface in some older API versions.
+    # We attempt to add it dynamically. RawIntDen is the sum of pixel values (uncorrected for calibration).
+    try:
+        MEASUREMENT_FLAGS |= Measurements.RAW_INTEGRATED_DENSITY
+    except AttributeError:
+        pass # Or define it manually if needed: MEASUREMENT_FLAGS |= 2097152
+else:
+    # Define dummy variables to prevent NameErrors in CPython parsing if referenced globally
+    # (Though they shouldn't be reached if logic is correct)
+    MEASUREMENT_FLAGS = 0
+
+# RESULT_LABELS: The column headers for the output TSV files.
+# These match the output format of the original SynapseJ macro to ensure compatibility with downstream analysis.
 RESULT_LABELS = ["Label", "Area", "Mean", "Min", "Max", "X", "Y", "XM", "YM", "Perim.", "Feret", "IntDen", "RawIntDen", "FeretX", "FeretY", "FeretAngle", "MinFeret"]
 
+# HEADER: Tab-separated string of result labels for writing to text files.
 HEADER = "\t".join(RESULT_LABELS[1:])
 
+# CORR_HEADER: Header for the correlation/colocalization analysis files.
+# Tracks the relationship between pre-synaptic and post-synaptic puncta.
 CORR_HEADER = "Image Name\t" + HEADER + "\tImage Name\t" + HEADER + "\tNo. of Post/Pre Puncta \tPost IntDen\tPostsynaptic Puncta No.\tOverlap\tDistance\tDistance M\n"
 
 
 def default_config():
-    """Return SynapseJ defaults (User Guide Section 4, Table 1)."""
+    """
+    Return SynapseJ defaults (User Guide Section 4, Table 1).
+    
+    This configuration dictionary defines the default parameters for the synapse detection algorithm.
+    These values are empirically determined settings described in the SynapseJ documentation
+    and are used when no external configuration file is provided.
+    """
     return {
-        'source_dir': '',
-        'dest_dir': '',
-        'pre_channel': 4,
-        'post_channel': 3,
-        'pre_marker_channel': 2,  # Ref: SynapseJ_v_1.ijm line 32 (Channels[1] = C2)
-        'post_marker_channel': 1, # Ref: SynapseJ_v_1.ijm line 33 (Channels[0] = C1)
-        'pre_min': 658,           # Ref: SynapseJ_v_1.ijm line 35
-        'pre_noise': 350,         # Ref: SynapseJ_v_1.ijm line 36
-        'pre_size_low': 0.08,     # Ref: SynapseJ_v_1.ijm line 37
-        'pre_size_high': 2.5,     # Ref: SynapseJ_v_1.ijm line 38
-        'pre_blur': True,         # Ref: SynapseJ_v_1.ijm line 39
-        'pre_blur_radius': 2,     # Ref: SynapseJ_v_1.ijm line 40
-        'pre_bkd': 0,             # Ref: SynapseJ_v_1.ijm line 41
-        'pre_use_maxima': True,   # Ref: SynapseJ_v_1.ijm line 42
-        'pre_apply_fade': False,  # Ref: SynapseJ_v_1.ijm line 43
-        'pre_fade_factors': '',
-        'post_min': 578,          # Ref: SynapseJ_v_1.ijm line 44
-        'post_noise': 350,        # Ref: SynapseJ_v_1.ijm line 45
-        'post_size_low': 0.08,    # Ref: SynapseJ_v_1.ijm line 46
-        'post_size_high': 2.5,    # Ref: SynapseJ_v_1.ijm line 47
-        'post_blur': True,        # Ref: SynapseJ_v_1.ijm line 48
-        'post_blur_radius': 2,    # Ref: SynapseJ_v_1.ijm line 49
-        'post_bkd': 0,            # Ref: SynapseJ_v_1.ijm line 50
-        'post_use_maxima': True,  # Ref: SynapseJ_v_1.ijm line 51
-        'post_apply_fade': False, # Ref: SynapseJ_v_1.ijm line 52
-        'overlap_pixels': 1,      # Ref: SynapseJ_v_1.ijm line 53
-        'dilate_pixels': 1,       # Ref: SynapseJ_v_1.ijm line 55
-        'dilate_enabled': False,
-        'slice_number': 2,        # Ref: SynapseJ_v_1.ijm line 56
-        'grid_size': 80,
-        'pre_marker_min': 484,    # Ref: SynapseJ_v_1.ijm line 73 (Thr Min Int)
-        'pre_marker_max': 895,    # Ref: SynapseJ_v_1.ijm line 72 (Thr Max Int)
-        'pre_marker_size': 250,   # Ref: SynapseJ_v_1.ijm line 74 (Thr Sz)
-        'post_marker_min': 273,   # Ref: SynapseJ_v_1.ijm line 83 (For Min Int)
-        'post_marker_max': 692,   # Ref: SynapseJ_v_1.ijm line 82 (For Max Int)
-        'post_marker_size': 300,  # Ref: SynapseJ_v_1.ijm line 84 (For Sz)
+        'source_dir': '',         # Directory containing input images.
+        'dest_dir': '',           # Directory where results will be saved.
+        'pre_channel': 4,         # Channel number for Pre-synaptic marker (e.g., Bassoon).
+        'post_channel': 3,        # Channel number for Post-synaptic marker (e.g., Homer1).
+        'pre_marker_channel': 2,  # Channel for an additional Pre-synaptic marker (optional). Ref: SynapseJ_v_1.ijm line 32 (Channels[1] = C2)
+        'post_marker_channel': 1, # Channel for an additional Post-synaptic marker (optional). Ref: SynapseJ_v_1.ijm line 33 (Channels[0] = C1)
+        
+        # --- Pre-synaptic Detection Parameters ---
+        'pre_min': 658,           # Intensity threshold for pre-synaptic puncta. Pixels below this are ignored. Ref: SynapseJ_v_1.ijm line 35
+        'pre_noise': 350,         # Noise tolerance for 'Find Maxima'. Determines peak sensitivity. Ref: SynapseJ_v_1.ijm line 36
+        'pre_size_low': 0.08,     # Minimum size (µm²) for a valid pre-synaptic puncta. Filters out noise. Ref: SynapseJ_v_1.ijm line 37
+        'pre_size_high': 2.5,     # Maximum size (µm²) for a valid pre-synaptic puncta. Filters out aggregates. Ref: SynapseJ_v_1.ijm line 38
+        'pre_blur': True,         # Whether to apply median blurring to reduce noise before detection. Ref: SynapseJ_v_1.ijm line 39
+        'pre_blur_radius': 2,     # Radius (pixels) for the median blur filter. Ref: SynapseJ_v_1.ijm line 40
+        'pre_bkd': 0,             # Radius for Rolling Ball background subtraction (0 = disabled). Ref: SynapseJ_v_1.ijm line 41
+        'pre_use_maxima': True,   # If True, uses 'Find Maxima' (segmentation). If False, uses simple Thresholding. Ref: SynapseJ_v_1.ijm line 42
+        'pre_apply_fade': False,  # Whether to apply depth-dependent intensity correction (fading correction). Ref: SynapseJ_v_1.ijm line 43
+        'pre_fade_factors': '',   # List of correction factors for fading, one per slice.
+        
+        # --- Post-synaptic Detection Parameters ---
+        'post_min': 578,          # Intensity threshold for post-synaptic puncta. Ref: SynapseJ_v_1.ijm line 44
+        'post_noise': 350,        # Noise tolerance for post-synaptic 'Find Maxima'. Ref: SynapseJ_v_1.ijm line 45
+        'post_size_low': 0.08,    # Minimum size (µm²) for post-synaptic puncta. Ref: SynapseJ_v_1.ijm line 46
+        'post_size_high': 2.5,    # Maximum size (µm²) for post-synaptic puncta. Ref: SynapseJ_v_1.ijm line 47
+        'post_blur': True,        # Apply median blur to post-synaptic channel. Ref: SynapseJ_v_1.ijm line 48
+        'post_blur_radius': 2,    # Radius for post-synaptic median blur. Ref: SynapseJ_v_1.ijm line 49
+        'post_bkd': 0,            # Background subtraction radius for post-synaptic channel. Ref: SynapseJ_v_1.ijm line 50
+        'post_use_maxima': True,  # Use 'Find Maxima' for post-synaptic detection. Ref: SynapseJ_v_1.ijm line 51
+        'post_apply_fade': False, # Apply fading correction to post-synaptic channel. Ref: SynapseJ_v_1.ijm line 52
+        
+        # --- Colocalization Parameters ---
+        'overlap_pixels': 1,      # Minimum number of overlapping pixels required to define a synapse. Ref: SynapseJ_v_1.ijm line 53
+        'dilate_pixels': 1,       # Number of pixels to dilate the mask by (if enabled). Ref: SynapseJ_v_1.ijm line 55
+        'dilate_enabled': False,  # Whether to dilate the puncta masks before checking overlap.
+        'slice_number': 2,        # Number of slices in the stack (used for fading correction logic). Ref: SynapseJ_v_1.ijm line 56
+        'grid_size': 80,          # Grid size for tile-based processing (not heavily used in this script but present in config).
+        
+        # --- Marker Channel Gating Parameters ---
+        # These parameters define intensity and size gates for the optional marker channels (e.g., MAP2, GFAP).
+        # Puncta are only retained if they overlap with a marker region satisfying these criteria.
+        'pre_marker_min': 484,    # Minimum intensity for Pre-marker channel. Ref: SynapseJ_v_1.ijm line 73 (Thr Min Int)
+        'pre_marker_max': 895,    # Maximum intensity for Pre-marker channel. Ref: SynapseJ_v_1.ijm line 72 (Thr Max Int)
+        'pre_marker_size': 250,   # Minimum size (pixels/units) for Pre-marker regions. Ref: SynapseJ_v_1.ijm line 74 (Thr Sz)
+        'post_marker_min': 273,   # Minimum intensity for Post-marker channel. Ref: SynapseJ_v_1.ijm line 83 (For Min Int)
+        'post_marker_max': 692,   # Maximum intensity for Post-marker channel. Ref: SynapseJ_v_1.ijm line 82 (For Max Int)
+        'post_marker_size': 300,  # Minimum size (pixels/units) for Post-marker regions. Ref: SynapseJ_v_1.ijm line 84 (For Sz)
     }
 
 
 class SynapseJ4ChannelComplete(object):
-    """One-to-one SynapseJ reproduction that mirrors macro logic and documentation.
+    """
+    One-to-one SynapseJ reproduction that mirrors macro logic and documentation.
+
+    This class encapsulates the entire SynapseJ analysis pipeline. It is designed to be
+    instantiated once per run, processing a directory of images.
 
     Every processing step is backed by an explicit citation to SynapseJ_v_1.ijm,
     the SynapseJ User Guide, or the 2021 bioRxiv paper (Moreno Manrique et al.).
@@ -97,20 +301,33 @@ class SynapseJ4ChannelComplete(object):
     """
 
     def __init__(self, config_path=None):
-        """Load configuration, channels, and accumulator tables (User Guide Section 4)."""
+        """
+        Initialize the analyzer, load configuration, and prepare result accumulators.
+        
+        Args:
+            config_path (str): Path to a configuration file (optional). If None, defaults are used.
+        """
         from ij import Prefs
+        # Ensure global preference for black background is set, critical for correct thresholding.
+        # If this is False, ImageJ assumes white background, inverting threshold logic.
         Prefs.blackBackground = True
         
-        self.results_summary = []
-        self.all_pre_results = []
-        self.all_post_results = []
-        self.syn_pre_results = []
-        self.syn_post_results = []
-        self.synapse_pair_rows = []
+        # Initialize lists to hold results from all processed images.
+        # These correspond to the various output tables generated by the original macro.
+        self.results_summary = []       # Collated ResultsIF: Summary counts per image.
+        self.all_pre_results = []       # All Pre Results: Detailed metrics for every detected pre-synaptic puncta.
+        self.all_post_results = []      # All Post Results: Detailed metrics for every detected post-synaptic puncta.
+        self.syn_pre_results = []       # Synaptic Pre Results: Metrics for pre-synaptic puncta that are part of a synapse.
+        self.syn_post_results = []      # Synaptic Post Results: Metrics for post-synaptic puncta that are part of a synapse.
+        self.synapse_pair_rows = []     # (Unused in current logic but reserved for pair-wise data).
 
         # Correlation tables (MatchROI). Start with header rows mirroring the
         # "Pre to Post Correlation Window" / "Post to Pre Correlation Window".
+        # These tables track the nearest neighbor relationships between channels.
         self.pre_correlation_rows = [CORR_HEADER.strip()]
+        
+        # Create the header for the reverse correlation (Post -> Pre) by swapping terms.
+        # This ensures the output file headers are accurate for the direction of analysis.
         reverse_header = CORR_HEADER.replace('Post/Pre', 'Pre/Post') \
                          .replace('Post IntDen', 'Pre IntDen') \
                          .replace('Postsynaptic', 'Presynaptic')
@@ -118,6 +335,8 @@ class SynapseJ4ChannelComplete(object):
 
         self.log_messages = []
 
+        # Load configuration: Start with defaults, then override with file if provided.
+        # This allows for flexible deployment: defaults for quick tests, config files for batch runs.
         self.config = default_config()
         if config_path:
             self._load_config(config_path)
@@ -125,12 +344,21 @@ class SynapseJ4ChannelComplete(object):
         # All accumulators above mirror the macro's Collated ResultsIF, All Pre Results, etc.
 
         cfg = self.config
+        # Slice number is used for fading correction validation.
         self.slice_number = int(cfg.get('slice_number', 2))
 
+        # Organize parameters into dictionaries for easier passing to processing functions.
+        # This groups related settings (thresholds, noise, blur) by channel.
         self.pre_params = self._build_channel_params('pre')
         self.post_params = self._build_channel_params('post')
+        
+        # Parse marker thresholds if marker channels are enabled.
+        # These are optional gates; if missing, no marker filtering is performed.
         self.pre_marker_thresholds = self._build_marker_thresholds('pre')
         self.post_marker_thresholds = self._build_marker_thresholds('post')
+        
+        # Extract individual configuration values to instance variables for quick access.
+        # This avoids repeated dictionary lookups during the tight processing loops.
         self.source_dir = cfg['source_dir']
         self.dest_dir = cfg['dest_dir']
         self.pre_channel = int(cfg['pre_channel'])
@@ -175,32 +403,48 @@ class SynapseJ4ChannelComplete(object):
             self.log('WARNING: Config file {} not found; defaults remain active.'.format(path))
             return
         self.log('Loading config from {}'.format(path))
+        
+        # Open the config file and read line by line.
         with open(path, 'r') as handle:
             for raw in handle:
                 line = raw.strip()
+                # Skip empty lines and comments (lines starting with #).
                 if not line or line.startswith('#'):
                     continue
+                # Expect key=value format. Skip lines that don't match.
                 if '=' not in line:
                     continue
+                
+                # Split into key and value.
                 key, value = [token.strip() for token in line.split('=', 1)]
                 self.log('Config: {} = {}'.format(key, value))
+                
+                # Only update keys that exist in the default config.
+                # This prevents arbitrary injection of unknown parameters.
                 if key not in self.config:
                     continue
+                
                 # Boolean parsing first, then numeric, falling back to raw string to match macro.
+                # This robust parsing handles the variety of formats found in ImageJ macro configs.
                 lower = value.lower()
                 if lower in ['true', 'false']:
                     self.config[key] = (lower == 'true')
                 else:
                     try:
+                        # Try parsing as integer.
                         self.config[key] = int(value)
                     except ValueError:
                         try:
+                            # Try parsing as float.
                             self.config[key] = float(value)
                         except ValueError:
+                            # Fallback to string.
                             self.config[key] = value
 
     def _build_channel_params(self, prefix):
         """Bundle per-channel detection knobs (macro PrepChannel inputs)."""
+        # Creates a standardized dictionary for passing to 'prepare_channel'.
+        # This decouples the processing logic from the specific configuration keys.
         return {
             'min': float(self.config['{}_min'.format(prefix)]),
             'noise': float(self.config['{}_noise'.format(prefix)]),
@@ -216,13 +460,19 @@ class SynapseJ4ChannelComplete(object):
 
     def _parse_fade_factors(self, raw_value, slice_number):
         """Normalize fading correction vectors (macro fadingCorr block)."""
+        # Return empty list if no value provided.
         if raw_value in [None, '', 0]:
             return []
+            
+        # Handle single numeric value (rare but possible).
         if isinstance(raw_value, (int, float)):
             factors = [float(raw_value)]
         else:
+            # Handle various delimiters used in config files (semicolon, pipe, comma).
+            # The macro is flexible, so we must be too.
             normalized = str(raw_value).replace(';', ',').replace('|', ',')
-            # Macro accepts semi-colon, comma, or pipe delimited fading factors; mirror that.
+            
+            # Parse the delimited string into a list of floats.
             factors = []
             for token in normalized.split(','):
                 token = token.strip()
@@ -232,25 +482,37 @@ class SynapseJ4ChannelComplete(object):
                     factors.append(float(token))
                 except ValueError:
                     continue
+                    
         if not factors:
             return []
+            
+        # Ensure the factor list matches the stack depth (slice_number).
+        # If we have more slices than factors, we need to extrapolate.
         if slice_number > len(factors):
             last = factors[-1]
             # Macro repeats last factor when stack deeper than provided values.
+            # This assumes the fading stabilizes at the deepest measured point.
             factors.extend([last] * (slice_number - len(factors)))
         elif slice_number < len(factors):
             # Trim extras so vector length always equals number of slices processed.
             factors = factors[:slice_number]
+            
         return factors
 
     def _build_marker_thresholds(self, prefix):
         """Extract optional marker intensity gates (User Guide Section 5)."""
+        # Retrieve the raw configuration values for the marker channel.
         min_val = self.config['{}_marker_min'.format(prefix)]
         max_val = self.config['{}_marker_max'.format(prefix)]
         size_val = self.config['{}_marker_size'.format(prefix)]
+        
+        # Check if any required parameter is missing or zero/empty.
+        # The macro logic dictates that if ANY of these are not set, the marker gating is skipped.
         if min_val in [None, '', 0] or max_val in [None, '', 0] or size_val in [None, '', 0]:
             # If any entry missing, macro skips marker gating entirely for that channel.
             return None
+            
+        # Return the validated thresholds as a dictionary.
         return {
             'min': float(min_val),
             'max': float(max_val),
@@ -259,6 +521,9 @@ class SynapseJ4ChannelComplete(object):
 
     def log_configuration_summary(self):
         """Emit IFALog-style summary lines closely matching the macro."""
+        # This log output is critical for reproducibility. It records the exact parameters
+        # used for the analysis, allowing researchers to verify settings later.
+        
         # Pre-synaptic channel summary
         self.log('Measuring Presynaptic marker C{} channel at noise {} above {} bigger than {} and smaller than {}'.
                  format(self.pre_channel,
@@ -367,41 +632,78 @@ class SynapseJ4ChannelComplete(object):
         """Apply fading correction exactly as SynapseJ_v_1.ijm fadingCorr block (lines 470-490)."""
         if not factors:
             return
-        for s in range(1, imp.getStackSize() + 1):
-            imp.setSlice(s)
-            factor = factors[s-1]
-            IJ.run(imp, "Multiply...", "value=" + str(factor) + " slice")
+            
+        stack = imp.getStack()
+        n_slices = imp.getStackSize()
+        
+        # Define the per-slice operation
+        def fade_slice(i):
+            # i is 0-based index from parallel_for
+            slice_idx = i + 1
+            
+            # Check if we have a factor for this slice index.
+            # factors is 0-indexed.
+            if i < len(factors):
+                factor = factors[i]
+                # Retrieve the processor for the current slice.
+                ip = stack.getProcessor(slice_idx)
+                # Apply multiplication directly to the pixel data.
+                # This is faster and thread-safe compared to IJ.run("Multiply...")
+                ip.multiply(factor)
+        
+        # Execute in parallel
+        ParallelUtils.parallel_for(fade_slice, n_slices)
+            
         self.log('{} fading correction applied with factors {}'.format(label, factors))
 
     def segment_dense_image(self, imp, noise, min_threshold):
         """Run Find Maxima in SEGMENTED mode (macro Maxima_Stack) for dense puncta."""
+        # Create a new stack to hold the segmented results.
+        # The output will be an 8-bit image where regions are separated by watershed lines.
         segmented_stack = ImageStack(imp.getWidth(), imp.getHeight())
         stack = imp.getStack()
         n_slices = imp.getNSlices()
         
         # self.log("DEBUG: segment_dense_image processing {} slices".format(n_slices))
         
+        # Define the per-slice processing logic.
         def process_slice(i):
-            # i is 0-based index for parallel_for, but slices are 1-based
-            slice_idx = i + 1
-            ip = stack.getProcessor(slice_idx).duplicate()
-            
-            # Macro logic: if min > 0, use "above". In API, this means passing the threshold.
-            # If min <= 0, pass ImageProcessor.NO_THRESHOLD to disable thresholding.
-            threshold_arg = ImageProcessor.NO_THRESHOLD
-            if min_threshold > 0:
-                threshold_arg = float(min_threshold)
+            try:
+                # i is 0-based index for parallel_for, but slices are 1-based
+                slice_idx = i + 1
+                # Duplicate the processor to avoid modifying the original image in a thread-unsafe way.
+                ip = stack.getProcessor(slice_idx).duplicate()
+                
+                # Macro logic: if min > 0, use "above". In API, this means passing the threshold.
+                # If min <= 0, pass ImageProcessor.NO_THRESHOLD to disable thresholding.
+                # This mimics the "Find Maxima..." dialog behavior.
+                threshold_arg = ImageProcessor.NO_THRESHOLD
+                if min_threshold > 0:
+                    threshold_arg = float(min_threshold)
 
-            mf = MaximumFinder()
-            # findMaxima(ip, tolerance, threshold, outputType, excludeOnEdges, isEDM)
-            segmented_proc = mf.findMaxima(ip, float(noise), threshold_arg, MaximumFinder.SEGMENTED, False, False)
-            
-            if segmented_proc is None:
-                segmented_proc = ByteProcessor(imp.getWidth(), imp.getHeight())
-            return segmented_proc
+                mf = MaximumFinder()
+                # findMaxima(ip, tolerance, threshold, outputType, excludeOnEdges, isEDM)
+                # SEGMENTED output type produces a watershed-segmented image where each maximum is a particle.
+                # This is effective for separating touching puncta in dense regions.
+                segmented_proc = mf.findMaxima(ip, float(noise), threshold_arg, MaximumFinder.SEGMENTED, False, False)
+                
+                # Handle edge case where no maxima are found (returns None).
+                # In this case, return a blank black image.
+                if segmented_proc is None:
+                    segmented_proc = ByteProcessor(imp.getWidth(), imp.getHeight())
+                return segmented_proc
+            except Exception as e:
+                self.log("ERROR in segment_dense_image slice {}: {}".format(i, e))
+                import traceback
+                traceback.print_exc()
+                return ByteProcessor(imp.getWidth(), imp.getHeight())
 
+        # Execute slice processing in parallel to speed up the operation.
+        # Segmentation can be computationally expensive, so threading helps here.
         results = ParallelUtils.parallel_for(process_slice, n_slices)
         
+        # Reassemble the stack from the processed slices.
+        # The order is preserved by parallel_for.
         for proc in results:
             segmented_stack.addSlice(proc)
             
@@ -410,62 +712,135 @@ class SynapseJ4ChannelComplete(object):
         return segmented_imp
 
     def process_directory(self):
+        """
+        Main execution loop: Process all images in the source directory.
+        
+        This method orchestrates the batch processing workflow:
+        1. Validates input/output directories.
+        2. Creates necessary subdirectories for results.
+        3. Logs the configuration for reproducibility.
+        4. Iterates through all supported image files in the source directory.
+        5. Calls 'process_image' for each file.
+        6. Aggregates and saves the final results.
+        """
+        # Validate source directory.
         if not os.path.isdir(self.source_dir):
             self.log('ERROR: source_dir {} does not exist.'.format(self.source_dir))
             return
+            
+        # Set default destination if not provided.
         if not self.dest_dir:
             self.dest_dir = os.path.join(self.source_dir, 'Synapse_Output')
+            
+        # Define subdirectories for organized output.
         self.merge_dir = os.path.join(self.dest_dir, 'merge')
         self.excel_dir = os.path.join(self.dest_dir, 'excel')
+        
+        # Create output directories if they don't exist.
         for folder in [self.dest_dir, self.merge_dir, self.excel_dir]:
             if not os.path.exists(folder):
                 os.makedirs(folder)
+                
+        # Log the full configuration parameters to the console and log file.
         self.log_configuration_summary()
+        
         image_files = []
+        # Scan the source directory for supported image formats.
+        # We support TIFF (.tif, .tiff) and Nikon ND2 (.nd2) files.
         for name in sorted(os.listdir(self.source_dir)):
             lower = name.lower()
             if lower.endswith('.tif') or lower.endswith('.tiff') or lower.endswith('.nd2'):
                 image_files.append(os.path.join(self.source_dir, name))
+                
         self.log('Found {} image(s) to analyze.'.format(len(image_files)))
+        
+        # Process each image sequentially.
+        # Note: While channel processing within an image is parallelized, 
+        # we process images one by one to manage memory usage effectively.
         for path in image_files:
             try:
                 self.process_image(path)
             except (Exception, Throwable) as exc:
+                # Catch both Python exceptions and Java Throwables (e.g., OutOfMemoryError).
+                # This ensures that one bad image doesn't crash the entire batch run.
                 import traceback
                 self.log('ERROR processing {}: {}'.format(path, exc))
+                if hasattr(exc, 'getCause') and exc.getCause():
+                    self.log('  Cause: {}'.format(exc.getCause()))
+                if hasattr(exc, 'printStackTrace'):
+                    exc.printStackTrace()
                 traceback.print_exc()
+                
+        # Save aggregated results after all images are processed.
+        # This writes the "Collated Results" and other summary tables.
         self.save_all_results()
+        
+        # Save the execution log to disk.
         self.save_log()
+        
         self.log('All images processed; outputs saved to {}.'.format(self.dest_dir))
 
     def process_image(self, image_path):
-        """Replicate macro ProcessImage routine for one stack, including overlays."""
+        """
+        Process a single image stack: detect puncta, filter by markers, and analyze colocalization.
+        
+        This method replicates the 'ProcessImage' routine from the SynapseJ macro.
+        It handles:
+        1. Opening the image and splitting channels.
+        2. Independent detection of pre- and post-synaptic puncta (parallelized).
+        3. Optional filtering of puncta based on marker channel intensity (e.g., MAP2).
+        4. Saving intermediate results (ROIs, measurements).
+        
+        Args:
+            image_path (str): Absolute path to the image file.
+        """
         self.log('\n' + '=' * 80)
         self.log('PROCESSING: {}'.format(os.path.basename(image_path)))
+        
+        # Open the image using ImageJ's standard opener.
         imp = IJ.openImage(image_path)
         if imp is None:
             self.log('  ERROR: Fiji could not open {}'.format(image_path))
             return
+            
         name_short = os.path.splitext(os.path.basename(image_path))[0]
+        
+        # Split the multi-channel image into individual ImagePlus objects.
+        # Note: ChannelSplitter returns an array of ImagePlus.
         channels = ChannelSplitter.split(imp)
         
+        # Duplicate channels for processing to avoid modifying the originals or causing thread conflicts.
+        # We need separate copies for segmentation (detection) and measurement (intensity quantification).
+        # Adjust indices to 0-based (User config is 1-based).
         pre_src = channels[self.pre_channel - 1].duplicate()
         post_src = channels[self.post_channel - 1].duplicate()
-        pre_seg = pre_src.duplicate()
-        post_seg = post_src.duplicate()
-        pre_measure = pre_src.duplicate()
-        post_measure = post_src.duplicate()
+        
+        pre_seg = pre_src.duplicate()      # For segmentation (Find Maxima/Threshold)
+        post_seg = post_src.duplicate()    # For segmentation
+        pre_measure = pre_src.duplicate()  # For intensity measurement
+        post_measure = post_src.duplicate()# For intensity measurement
 
         cal = imp.getCalibration()
-        # Removed forced calibration to match macro behavior (relies on image metadata or user setup)
+        # Note: We rely on the image's embedded calibration. If missing, ImageJ defaults to pixels.
 
+        # Define tasks for parallel execution of channel processing.
+        # This speeds up analysis significantly on multi-core systems.
         def run_pre():
+            # Detect pre-synaptic puncta
             return self.prepare_channel(pre_seg, pre_measure, name_short, 'Pre', cal, self.pre_params)
         
         def run_post():
+            # Detect post-synaptic puncta
             return self.prepare_channel(post_seg, post_measure, name_short, 'Post', cal, self.post_params)
             
+        # Execute detection in parallel.
+        # This is safe because we are operating on independent ImagePlus objects.
         results = ParallelUtils.run_tasks([run_pre, run_post])
+        
+        # Unpack results:
+        # entries: List of dictionaries containing ROI and metrics for every detected puncta.
+        # result_imp: The processed image (background subtracted, etc.) used for detection.
+        # mask_imp: The binary mask of detected puncta.
         pre_entries, pre_result_imp, pre_mask_imp = results[0]
         post_entries, post_result_imp, post_mask_imp = results[1]
 
@@ -475,15 +850,25 @@ class SynapseJ4ChannelComplete(object):
         pre_marker_count = 0
         post_marker_count = 0
 
-        # Capture total counts before gating for "Pre No." and "Post No." (macro Pre[row], Post[row])
+        # Capture total counts before gating for reporting purposes.
         pre_count_total = len(pre_entries)
         post_count_total = len(post_entries)
 
-        # Marker gating uses only median blur on the marker channel (no background subtraction),
-        # and filters puncta purely by Min/Max intensity, mirroring CoLocROI.
+        # --- Marker Channel Gating ---
+        # If a marker channel (e.g., MAP2 for dendrites) is defined, we filter the detected puncta.
+        # A punctum is retained ONLY if it overlaps with a valid region in the marker channel.
+        # The marker channel is processed with median blur (no background subtraction) and thresholded.
+        
         if self.pre_marker_channel > 0 and self.pre_marker_thresholds:
+            # Duplicate the marker channel for processing.
             marker_imp = channels[self.pre_marker_channel - 1].duplicate()
+            
+            # Preprocess marker: Median blur only (bkd=0), as per macro logic.
+            # We do NOT apply background subtraction to the marker channel, as we want to preserve broad structures.
             processed_marker = self._preprocess_channel(marker_imp, self.pre_blur, self.pre_blur_radius, 0)
+            
+            # Filter pre-synaptic puncta against the pre-marker channel.
+            # This removes any puncta that are not "on top of" the marker signal.
             pre_entries = self._filter_by_intensity(
                 pre_entries,
                 processed_marker,
@@ -496,12 +881,19 @@ class SynapseJ4ChannelComplete(object):
             )
             pre_marker_count = len(pre_entries)
             self.log("Presynaptic marker gating: %d/%d puncta retained" % (pre_marker_count, pre_count_total))
+            
+            # Clean up temporary images.
             processed_marker.close()
             marker_imp.close()
 
         if self.post_marker_channel > 0 and self.post_marker_thresholds:
+            # Duplicate the marker channel.
             marker_imp = channels[self.post_marker_channel - 1].duplicate()
+            
+            # Preprocess marker: Median blur only.
             processed_marker = self._preprocess_channel(marker_imp, self.post_blur, self.post_blur_radius, 0)
+            
+            # Filter post-synaptic puncta against the post-marker channel.
             post_entries = self._filter_by_intensity(
                 post_entries,
                 processed_marker,
@@ -514,6 +906,8 @@ class SynapseJ4ChannelComplete(object):
             )
             post_marker_count = len(post_entries)
             self.log("Postsynaptic marker gating: %d/%d puncta retained" % (post_marker_count, post_count_total))
+            
+            # Clean up.
             processed_marker.close()
             marker_imp.close()
 
@@ -524,8 +918,12 @@ class SynapseJ4ChannelComplete(object):
             # Attempt to parse resolution if available, similar to macro's getScaleAndUnit behavior
             pass 
 
+        # Extract metrics for saving
         pre_rows = [entry['metrics'] for entry in pre_entries]
         post_rows = [entry['metrics'] for entry in post_entries]
+        
+        # Save "All Pre Results" and "All Post Results" tables.
+        # These contain every detected punctum (after marker gating) regardless of synaptic status.
         if pre_rows:
             self.all_pre_results.extend(pre_rows)
             self.save_results_table(pre_rows, os.path.join(self.dest_dir, '{}Pre.txt'.format(name_short)))
@@ -535,13 +933,22 @@ class SynapseJ4ChannelComplete(object):
             self.save_results_table(post_rows, os.path.join(self.dest_dir, '{}Post.txt'.format(name_short)))
             self.save_roi_set([entry['roi'] for entry in post_entries], os.path.join(self.dest_dir, '{}PostALLRoiSet.zip'.format(name_short)))
 
-        # Synapse Finding
+        # --- Synapse Finding ---
+        # Identify synapses by checking for overlap between pre- and post-synaptic puncta.
+        # assoc_roi returns the subset of ROIs that have a partner in the other channel.
+        
+        # Find Post-synaptic puncta that overlap with Pre-synaptic puncta.
+        # We check 'post_entries' against 'pre_result_imp'.
         syn_post_rois = self.assoc_roi(pre_result_imp, post_result_imp, post_mask_imp, [entry['roi'] for entry in post_entries], self.pre_params['min'], self.overlap_pixels)
+        
+        # Find Pre-synaptic puncta that overlap with Post-synaptic puncta.
+        # We check 'pre_entries' against 'post_result_imp'.
         syn_pre_rois = self.assoc_roi(post_result_imp, pre_result_imp, pre_mask_imp, [entry['roi'] for entry in pre_entries], self.post_params['min'], self.overlap_pixels)
 
         self.log('  Synapse count (Pre): {}'.format(len(syn_pre_rois)))
         self.log('  Synapse count (Post): {}'.format(len(syn_post_rois)))
 
+        # Measure and save the confirmed synaptic puncta.
         if syn_pre_rois:
             syn_pre_rows = self.measure_rois(syn_pre_rois, pre_result_imp, name_short, 'Pre', cal)
             self.syn_pre_results.extend(syn_pre_rows)
@@ -557,15 +964,18 @@ class SynapseJ4ChannelComplete(object):
             self.save_roi_set(syn_post_rois, os.path.join(self.dest_dir, '{}PostSYNRoiSet.zip'.format(name_short)))
 
         # Always save filtered images, even if no synapses were detected, to match macro behavior.
+        # These images show the puncta after background subtraction and masking.
         IJ.save(pre_result_imp, os.path.join(self.dest_dir, '{}PreF.tif'.format(name_short)))
         IJ.save(post_result_imp, os.path.join(self.dest_dir, '{}PostF.tif'.format(name_short)))
 
-        # Correlation Analysis
-        # Disable dilation for correlation map to match macro
+        # --- Correlation Analysis ---
+        # Create label maps where pixel values = particle IDs.
+        # Disable dilation for correlation map to match macro behavior.
         pre_label_map = self._create_label_map(pre_result_imp, [entry['roi'] for entry in pre_entries], 0)
         post_label_map = self._create_label_map(post_result_imp, [entry['roi'] for entry in post_entries], 0)
         
         if pre_entries and post_entries:
+            # Calculate nearest neighbor relationships.
             self.pre_correlation_rows.extend(self.match_roi(pre_entries, post_entries, post_label_map, 'Pre', 'Post', cal))
             self.post_correlation_rows.extend(self.match_roi(post_entries, pre_entries, pre_label_map, 'Post', 'Pre', cal))
             
@@ -595,146 +1005,268 @@ class SynapseJ4ChannelComplete(object):
         )
 
     def _find_puncta(self, processed_imp, noise_tolerance, threshold_val, size_low_um, size_high_um, cal):
-            """Pixel-exact Find Maxima → Segmented Particles → ParticleAnalyzer with silent RoiManager."""
-            # Use API directly to avoid headless issues and match segment_dense_image logic
-            ip = processed_imp.getProcessor()
+        """
+        Detect puncta using 'Find Maxima' and 'Particle Analyzer'.
+        
+        This helper method encapsulates the core detection logic when 'use_maxima' is True.
+        It mimics the "Find Maxima -> Segmented Particles" workflow of ImageJ.
+        
+        Note: This method is currently unused in the main pipeline (which uses 'prepare_channel' logic),
+        but is kept as a reference implementation or for potential future use in 'segment_dense_image'.
+        
+        Args:
+            processed_imp (ImagePlus): The preprocessed image.
+            noise_tolerance (float): Tolerance for finding local maxima.
+            threshold_val (float): Minimum intensity threshold.
+            size_low_um (float): Minimum size in µm².
+            size_high_um (float): Maximum size in µm².
+            cal (Calibration): Image calibration.
             
-            threshold_arg = ImageProcessor.NO_THRESHOLD
-            if threshold_val > 0:
-                threshold_arg = float(threshold_val)
+        Returns:
+            list: A list of dictionaries containing 'roi' and 'metrics' for each detected punctum.
+        """
+        # Use API directly to avoid headless issues and match segment_dense_image logic.
+        ip = processed_imp.getProcessor()
+        
+        # Determine threshold argument for Find Maxima.
+        # If threshold_val <= 0, we pass NO_THRESHOLD to disable it.
+        threshold_arg = ImageProcessor.NO_THRESHOLD
+        if threshold_val > 0:
+            threshold_arg = float(threshold_val)
 
-            mf = MaximumFinder()
-            segmented_proc = mf.findMaxima(ip, float(noise_tolerance), threshold_arg, MaximumFinder.SEGMENTED, False, False)
+        # Run Find Maxima in SEGMENTED mode.
+        # This creates a watershed-segmented image where each maximum is a particle.
+        # The background is 0, and particles are separated by 0-value lines.
+        mf = MaximumFinder()
+        segmented_proc = mf.findMaxima(ip, float(noise_tolerance), threshold_arg, MaximumFinder.SEGMENTED, False, False)
 
-            if segmented_proc is None:
-                self.log("ERROR: Find Maxima produced no output image")
-                return []
+        if segmented_proc is None:
+            self.log("ERROR: Find Maxima produced no output image")
+            return []
 
-            segmented = ImagePlus("Segmented", segmented_proc)
-            # segmented_proc is ByteProcessor (8-bit)
+        # Wrap the processor in an ImagePlus for ParticleAnalyzer.
+        segmented = ImagePlus("Segmented", segmented_proc)
+        # segmented_proc is ByteProcessor (8-bit).
 
-            rt = ResultsTable()
-            rt.reset()
+        # Prepare ResultsTable to capture measurements (though we extract them manually later).
+        rt = ResultsTable()
+        rt.reset()
 
-            # Use SHOW_MASKS instead of ADD_TO_MANAGER to avoid HeadlessException
-            pa_flags = ParticleAnalyzer.SHOW_MASKS | ParticleAnalyzer.CLEAR_WORKSHEET
+        # Configure ParticleAnalyzer.
+        # SHOW_MASKS: Output a binary mask of detected particles.
+        # CLEAR_WORKSHEET: Clear previous results.
+        # We use SHOW_MASKS instead of ADD_TO_MANAGER to avoid HeadlessException in some environments.
+        pa_flags = ParticleAnalyzer.SHOW_MASKS | ParticleAnalyzer.CLEAR_WORKSHEET
 
-            pa = ParticleAnalyzer(pa_flags, MEASUREMENT_FLAGS, rt, size_low_um, size_high_um, 0.0, 1.0)
-            pa.setHideOutputImage(True)
-            pa.analyze(segmented)
+        # Initialize ParticleAnalyzer with size constraints.
+        # Note: size_low_um and size_high_um are passed directly. 
+        # If the image is calibrated, PA uses these as physical units.
+        pa = ParticleAnalyzer(pa_flags, MEASUREMENT_FLAGS, rt, size_low_um, size_high_um, 0.0, 1.0)
+        
+        # Suppress display of the output image.
+        pa.setHideOutputImage(True)
+        
+        # Run analysis on the segmented image.
+        pa.analyze(segmented)
+        
+        # Retrieve the binary mask of particles that satisfied the size criteria.
+        mask_imp = pa.getOutputImage()
+        
+        entries = []
+        if mask_imp:
+            from ij.gui import ShapeRoi
+            # Convert the binary mask to ROIs.
+            # Threshold the mask to select all object pixels (255).
+            mask_imp.getProcessor().setThreshold(128, 255, ImageProcessor.NO_LUT_UPDATE)
             
-            mask_imp = pa.getOutputImage()
+            # Run "Create Selection" to generate a composite ROI of all particles.
+            IJ.run(mask_imp, "Create Selection", "")
+            roi = mask_imp.getRoi()
             
-            entries = []
-            if mask_imp:
-                from ij.gui import ShapeRoi
-                mask_imp.getProcessor().setThreshold(128, 255, ImageProcessor.NO_LUT_UPDATE)
-                IJ.run(mask_imp, "Create Selection", "")
-                roi = mask_imp.getRoi()
+            rois = []
+            if roi:
+                # If multiple particles, the ROI is a ShapeRoi (composite).
+                # We split it into individual ROIs.
+                if isinstance(roi, ShapeRoi):
+                    rois = list(roi.getRois())
+                else:
+                    # Single particle found.
+                    rois = [roi]
+            
+            mask_imp.close()
+            
+            # Iterate through each detected ROI to measure properties on the ORIGINAL image.
+            for i, roi in enumerate(rois):
+                # Set the ROI on the input image (processed_imp).
+                processed_imp.setRoi(roi)
                 
-                rois = []
-                if roi:
-                    if isinstance(roi, ShapeRoi):
-                        rois = list(roi.getRois())
-                    else:
-                        rois = [roi]
+                # Measure statistics.
+                stats = processed_imp.getStatistics(MEASUREMENT_FLAGS)
                 
-                mask_imp.close()
-                
-                for i, roi in enumerate(rois):
-                    # Measure on original processed_imp? Or segmented?
-                    # Macro measures on the segmented image (which is binary/maxima)?
-                    # No, macro measures on the original image usually?
-                    # But _find_puncta is unused, so I'll just measure on segmented or processed_imp.
-                    # The original code measured on segmented (via rt).
-                    # But rt is empty if I don't use ADD_TO_MANAGER?
-                    # Wait, ParticleAnalyzer populates rt if I pass it?
-                    # Yes, but I need to associate measurements with ROIs.
-                    # If I have ROIs, I can measure.
-                    
-                    processed_imp.setRoi(roi)
-                    stats = processed_imp.getStatistics(MEASUREMENT_FLAGS)
-                    
-                    metrics = {
-                        'Label': "%s_%04d" % (processed_imp.getShortTitle(), i + 1),
-                        'Area': stats.area,
-                        'Mean': stats.mean,
-                        'Min': stats.min,
-                        'Max': stats.max,
-                        'X': stats.xCentroid,
-                        'Y': stats.yCentroid,
-                        'XM': stats.xCenterOfMass,
-                        'YM': stats.yCenterOfMass,
-                        'Perim.': stats.perimeter if hasattr(stats, 'perimeter') else roi.getLength(),
-                        'Feret': stats.feret,
-                        'IntDen': stats.integratedDensity,
-                        'RawIntDen': stats.rawIntegratedDensity if hasattr(stats, 'rawIntegratedDensity') else 0,
-                        'FeretX': stats.feretX,
-                        'FeretY': stats.feretY,
-                        'FeretAngle': stats.feretAngle,
-                        'MinFeret': stats.minFeret,
-                    }
-                    entries.append({'roi': roi, 'metrics': metrics})
+                # Compile metrics into a dictionary.
+                metrics = {
+                    'Label': "%s_%04d" % (processed_imp.getShortTitle(), i + 1),
+                    'Area': stats.area,
+                    'Mean': stats.mean,
+                    'Min': stats.min,
+                    'Max': stats.max,
+                    'X': stats.xCentroid,
+                    'Y': stats.yCentroid,
+                    'XM': stats.xCenterOfMass,
+                    'YM': stats.yCenterOfMass,
+                    'Perim.': stats.perimeter if hasattr(stats, 'perimeter') else roi.getLength(),
+                    'Feret': stats.feret,
+                    'IntDen': stats.integratedDensity,
+                    'RawIntDen': stats.rawIntegratedDensity if hasattr(stats, 'rawIntegratedDensity') else 0,
+                    'FeretX': stats.feretX,
+                    'FeretY': stats.feretY,
+                    'FeretAngle': stats.feretAngle,
+                    'MinFeret': stats.minFeret,
+                }
+                entries.append({'roi': roi, 'metrics': metrics})
 
-            segmented.changes = False
-            segmented.close()
+        segmented.changes = False
+        segmented.close()
 
-            return entries
+        return entries
 
     def _preprocess_channel(self, imp, blur_enabled, blur_radius, background_radius):
-            """Identical preprocessing to original macro: Median blur + rolling ball background subtraction."""
-            processed = imp.duplicate()
-            if blur_enabled:
-                IJ.run(processed, "Median...", "radius=" + str(blur_radius) + " stack")
-            if background_radius > 0:
-                subtracter = BackgroundSubtracter()
-                for s in range(1, processed.getNSlices() + 1):
-                    processed.setSlice(s)
-                    ip = processed.getProcessor()
-                    subtracter.rollingBallBackground(ip, float(background_radius), False, False, False, True, True)
-            return processed
+        """
+        Apply standard preprocessing: Median Blur and Rolling Ball Background Subtraction.
+        
+        This function replicates the preprocessing steps used in the SynapseJ macro.
+        
+        Args:
+            imp (ImagePlus): The image to preprocess.
+            blur_enabled (bool): Whether to apply median blur.
+            blur_radius (float): Radius for median blur.
+            background_radius (float): Radius for rolling ball background subtraction.
+            
+        Returns:
+            ImagePlus: The processed image (a duplicate of the input).
+        """
+        # Duplicate the input image to avoid modifying the original.
+        processed = imp.duplicate()
+        
+        if blur_enabled:
+            # Apply Median Blur to reduce noise while preserving edges.
+            # This is critical for reducing false positives from salt-and-pepper noise.
+            IJ.run(processed, "Median...", "radius=" + str(blur_radius) + " stack")
+            
+        if background_radius > 0:
+            # Apply Rolling Ball Background Subtraction to correct for uneven illumination.
+            # This removes the low-frequency background signal, isolating the high-frequency puncta.
+            subtracter = BackgroundSubtracter()
+            
+            # Iterate through each slice to apply the background subtraction.
+            for s in range(1, processed.getNSlices() + 1):
+                processed.setSlice(s)
+                ip = processed.getProcessor()
+                
+                # rollingBallBackground(ip, radius, createBackground, lightBackground, useParaboloid, doPresmooth, correctCorners)
+                # We use the standard settings: no paraboloid, presmoothing enabled, corner correction enabled.
+                subtracter.rollingBallBackground(ip, float(background_radius), False, False, False, True, True)
+                
+        return processed
 
 
     def prepare_channel(self, work_imp, measure_imp, base_name, label, cal, params):
-        """Per-channel pipeline matching SynapseJ PrepChannel: Mask -> Subtract -> Analyze."""
+        """
+        Execute the per-channel detection pipeline.
+        
+        This method corresponds to the 'PrepChannel' function in the SynapseJ macro.
+        It performs the following steps:
+        1. Preprocessing: Median blur and Fading correction.
+        2. Background Subtraction (Rolling Ball).
+        3. Detection:
+           - If use_maxima is True: Uses 'Find Maxima' to segment dense puncta.
+           - If use_maxima is False: Uses simple intensity thresholding.
+        4. Size Filtering: Removes particles outside the specified size range (µm²).
+        5. Mask Generation: Creates a binary mask of valid puncta.
+        6. Result Generation: Subtracts the mask from the original image to isolate puncta.
+        
+        Args:
+            work_imp (ImagePlus): The image to be processed (will be modified).
+            measure_imp (ImagePlus): The original image for intensity measurements.
+            base_name (str): Base filename for logging/output.
+            label (str): Channel label ('Pre' or 'Post').
+            cal (Calibration): Image calibration.
+            params (dict): Dictionary of detection parameters.
+        """
         from ij.plugin import ImageCalculator
         from ij.process import AutoThresholder
 
-        # self.log("DEBUG: {} prepare_channel input work_imp slices: {}".format(label, work_imp.getStackSize()))
-
+        # --- Step 1: Preprocessing (Blur & Fade) ---
+        
+        # Apply Median Blur if enabled. This reduces salt-and-pepper noise which can cause false detections.
         if params['blur']:
+            # Define a helper function to process a single slice 'i'.
             def blur_slice(i):
-                ip = work_imp.getStack().getProcessor(i+1)
-                RankFilters().rank(ip, params['blur_radius'], RankFilters.MEDIAN)
+                try:
+                    # Retrieve the ImageProcessor for the current slice (1-based index).
+                    ip = work_imp.getStack().getProcessor(i+1)
+                    # Apply the Median filter using the RankFilters plugin.
+                    # The radius determines the size of the neighborhood.
+                    RankFilters().rank(ip, params['blur_radius'], RankFilters.MEDIAN)
+                except Exception as e:
+                    self.log("ERROR in blur_slice {}: {}".format(i, e))
+            
+            # Execute the blur operation on all slices in parallel.
             ParallelUtils.parallel_for(blur_slice, work_imp.getStackSize())
         
+        # Apply Fading Correction if enabled. This compensates for signal loss in deeper tissue slices.
         if params.get('apply_fade') and params.get('fade_factors'):
             factors = params['fade_factors']
             def fade_slice(i):
-                if i < len(factors):
-                    work_imp.getStack().getProcessor(i+1).multiply(factors[i])
+                try:
+                    # Check if we have a factor for this slice index.
+                    if i < len(factors):
+                        # Multiply the pixel values of the slice by the correction factor.
+                        work_imp.getStack().getProcessor(i+1).multiply(factors[i])
+                except Exception as e:
+                    self.log("ERROR in fade_slice {}: {}".format(i, e))
+            
+            # Execute fading correction in parallel.
             ParallelUtils.parallel_for(fade_slice, work_imp.getStackSize())
             self.log('{} fading correction applied with factors {}'.format(label, factors))
 
+        # Keep a copy of the preprocessed image (before background subtraction) 
+        # to use as the "masked target" later. This ensures we subtract the mask 
+        # from the blurred/corrected image, not the background-subtracted one.
         masked_target = work_imp.duplicate()
         
+        # --- Step 2: Background Subtraction ---
+        
+        # Apply Rolling Ball background subtraction to remove uneven illumination/background haze.
         if params['background'] and params['background'] > 0:
             def bkd_slice(i):
-                ip = work_imp.getStack().getProcessor(i+1)
-                BackgroundSubtracter().rollingBallBackground(ip, float(params['background']), False, False, False, True, True)
+                try:
+                    ip = work_imp.getStack().getProcessor(i+1)
+                    # Run the Rolling Ball algorithm.
+                    # Parameters: radius, createBackground(False), lightBackground(False), 
+                    # useParaboloid(False), doPresmooth(True), correctCorners(True).
+                    BackgroundSubtracter().rollingBallBackground(ip, float(params['background']), False, False, False, True, True)
+                except Exception as e:
+                    self.log("ERROR in bkd_slice {}: {}".format(i, e))
+            
+            # Execute background subtraction in parallel.
             ParallelUtils.parallel_for(bkd_slice, work_imp.getStackSize())
             
         mask_imp = None
+        # Convert size bounds from µm² to pixels for ParticleAnalyzer.
+        # This is necessary because we often strip calibration during processing to avoid issues.
         min_pixels, max_pixels = self._size_bounds_in_pixels(params['size_low'], params['size_high'], cal)
         
-        # self.log("DEBUG: {} Calibration: {}x{} {}".format(label, cal.pixelWidth, cal.pixelHeight, cal.getUnit()))
-        # self.log("DEBUG: {} Size bounds (px): {}-{}".format(label, min_pixels, max_pixels))
+        # --- Step 3: Detection & Mask Generation ---
         
         if params['use_maxima']:
+            # Strategy A: Find Maxima (for dense puncta)
+            # This uses a local maximum search with a noise tolerance.
+            # It returns a segmented image where each "basin" is a particle.
             segmented_imp = self.segment_dense_image(work_imp, params['noise'], params['min'])
-            # self.log("DEBUG: {} segmented_imp slices: {}".format(label, segmented_imp.getStackSize()))
             
-            # Ensure we process in pixel units for the mask generation too
+            # Temporarily force pixel calibration for ParticleAnalyzer to ensure size filtering works in pixels.
+            # We copy the calibration to restore it later if needed.
             seg_cal = segmented_imp.getCalibration().copy()
             pixel_cal = seg_cal.copy()
             pixel_cal.setUnit("pixel")
@@ -744,22 +1276,38 @@ class SynapseJ4ChannelComplete(object):
             segmented_imp.setCalibration(pixel_cal)
             
             def process_maxima_mask(i):
-                slice_idx = i + 1
-                ip = segmented_imp.getStack().getProcessor(slice_idx)
-                ip.setThreshold(1, 255, ImageProcessor.NO_LUT_UPDATE)
-                
-                pa = ParticleAnalyzer(ParticleAnalyzer.SHOW_MASKS, 0, ResultsTable(), min_pixels, max_pixels)
-                pa.setHideOutputImage(True)
-                temp_imp = ImagePlus("temp", ip)
-                temp_imp.setCalibration(pixel_cal)
-                pa.analyze(temp_imp)
-                m = pa.getOutputImage()
-                if m:
-                    return m.getProcessor()
-                else:
+                try:
+                    slice_idx = i + 1
+                    ip = segmented_imp.getStack().getProcessor(slice_idx)
+                    # Threshold the segmented image (maxima are peaks, background is 0).
+                    # This converts the watershed basins into binary objects.
+                    ip.setThreshold(1, 255, ImageProcessor.NO_LUT_UPDATE)
+                    
+                    # Use ParticleAnalyzer to filter the segmented peaks by size.
+                    # SHOW_MASKS returns a binary image of particles that pass the size criteria.
+                    pa = ParticleAnalyzer(ParticleAnalyzer.SHOW_MASKS, 0, ResultsTable(), min_pixels, max_pixels)
+                    pa.setHideOutputImage(True)
+                    
+                    # Create a temporary ImagePlus for the analyzer.
+                    temp_imp = ImagePlus("temp", ip)
+                    temp_imp.setCalibration(pixel_cal)
+                    pa.analyze(temp_imp)
+                    
+                    # Get the mask of valid particles.
+                    m = pa.getOutputImage()
+                    if m:
+                        return m.getProcessor()
+                    else:
+                        # If no particles found, return a blank black processor.
+                        return ByteProcessor(segmented_imp.getWidth(), segmented_imp.getHeight())
+                except Exception as e:
+                    self.log("ERROR in process_maxima_mask {}: {}".format(i, e))
                     return ByteProcessor(segmented_imp.getWidth(), segmented_imp.getHeight())
 
+            # Run mask generation in parallel.
             mask_procs = ParallelUtils.parallel_for(process_maxima_mask, segmented_imp.getStackSize())
+            
+            # Reassemble the stack from the processed mask slices.
             mask_stack = ImageStack(segmented_imp.getWidth(), segmented_imp.getHeight())
             for p in mask_procs:
                 mask_stack.addSlice(p)
@@ -767,12 +1315,13 @@ class SynapseJ4ChannelComplete(object):
             mask_imp = ImagePlus("Mask", mask_stack)
             mask_imp.setCalibration(seg_cal) 
             
-            # self.log("DEBUG: {} mask_imp (from maxima) slices: {}".format(label, mask_imp.getStackSize()))
             segmented_imp.close()
         else:
+            # Strategy B: Simple Thresholding (for sparse puncta)
+            # Duplicate the work image to avoid modifying it further.
             temp_imp = work_imp.duplicate()
             
-            # Ensure we process in pixel units
+            # Ensure we process in pixel units for consistent size filtering.
             temp_cal = temp_imp.getCalibration().copy()
             pixel_cal = temp_cal.copy()
             pixel_cal.setUnit("pixel")
@@ -782,28 +1331,38 @@ class SynapseJ4ChannelComplete(object):
             temp_imp.setCalibration(pixel_cal)
             
             def process_thresh_mask(i):
-                slice_idx = i + 1
-                ip = temp_imp.getStack().getProcessor(slice_idx)
-                if params['min'] > 0:
-                    ip.setThreshold(params['min'], 65535, ImageProcessor.NO_LUT_UPDATE)
-                else:
-                    hist = ip.getHistogram()
-                    threshold = AutoThresholder().getThreshold(AutoThresholder.Method.Default, hist)
-                    ip.setThreshold(threshold, 65535, ImageProcessor.NO_LUT_UPDATE)
-                
-                t_imp = ImagePlus("temp", ip)
-                t_imp.setCalibration(pixel_cal)
-                
-                pa = ParticleAnalyzer(ParticleAnalyzer.SHOW_MASKS, 0, ResultsTable(), min_pixels, max_pixels)
-                pa.setHideOutputImage(True)
-                pa.analyze(t_imp)
-                m = pa.getOutputImage()
-                if m:
-                    return m.getProcessor()
-                else:
+                try:
+                    slice_idx = i + 1
+                    ip = temp_imp.getStack().getProcessor(slice_idx)
+                    if params['min'] > 0:
+                        # Apply fixed threshold if provided.
+                        # Pixels above 'min' are considered signal.
+                        ip.setThreshold(params['min'], 65535, ImageProcessor.NO_LUT_UPDATE)
+                    else:
+                        # Otherwise, use AutoThresholder (Default method) to find an optimal threshold.
+                        hist = ip.getHistogram()
+                        threshold = AutoThresholder().getThreshold(AutoThresholder.Method.Default, hist)
+                        ip.setThreshold(threshold, 65535, ImageProcessor.NO_LUT_UPDATE)
+                    
+                    t_imp = ImagePlus("temp", ip)
+                    t_imp.setCalibration(pixel_cal)
+                    
+                    # Use ParticleAnalyzer to filter by size.
+                    pa = ParticleAnalyzer(ParticleAnalyzer.SHOW_MASKS, 0, ResultsTable(), min_pixels, max_pixels)
+                    pa.setHideOutputImage(True)
+                    pa.analyze(t_imp)
+                    m = pa.getOutputImage()
+                    if m:
+                        return m.getProcessor()
+                    else:
+                        return ByteProcessor(temp_imp.getWidth(), temp_imp.getHeight())
+                except Exception as e:
+                    self.log("ERROR in process_thresh_mask {}: {}".format(i, e))
                     return ByteProcessor(temp_imp.getWidth(), temp_imp.getHeight())
 
+            # Run in parallel.
             mask_procs = ParallelUtils.parallel_for(process_thresh_mask, temp_imp.getStackSize())
+            
             mask_stack = ImageStack(temp_imp.getWidth(), temp_imp.getHeight())
             for p in mask_procs:
                 mask_stack.addSlice(p)
@@ -815,152 +1374,167 @@ class SynapseJ4ChannelComplete(object):
             temp_imp.close()
 
         if mask_imp is None:
+            # Fallback if something went wrong (shouldn't happen).
             masked_target.close()
             return [], work_imp, None
 
+        # Convert mask to 16-bit for arithmetic operations with the 16-bit original image.
         ImageConverter(mask_imp).convertToGray16()
         
-        def mult_invert_slice(i):
-            ip = mask_imp.getStack().getProcessor(i+1)
-            ip.multiply(257)
-            ip.invert()
-        ParallelUtils.parallel_for(mult_invert_slice, mask_imp.getStackSize())
+        # --- Step 4: Mask Inversion Logic ---
+        # The goal is to create a mask where:
+        # - Background pixels = 65535 (Max 16-bit value)
+        # - Object pixels = 0
+        # When we subtract this mask from the original image:
+        # - Original - 65535 -> 0 (Background removed)
+        # - Original - 0 -> Original (Object preserved)
         
+        def fix_mask_slice(i):
+            try:
+                ip = mask_imp.getStack().getProcessor(i+1)
+                # Currently, the mask has 0 (background) and >0 (objects) from the 8-bit conversion.
+                # We iterate pixels to enforce the logic described above.
+                
+                pixels = ip.getPixels() # short[] (signed in Java)
+                for j in range(len(pixels)):
+                    val = pixels[j] & 0xffff # Convert to unsigned int
+                    if val > 0: # Object
+                        pixels[j] = 0
+                    else: # Background
+                        pixels[j] = -1 # 0xFFFF (65535) in signed short
+            except Exception as e:
+                self.log("ERROR in fix_mask_slice {}: {}".format(i, e))
+                    
+        ParallelUtils.parallel_for(fix_mask_slice, mask_imp.getStackSize())
+        
+        # Optional Dilation: Expands the "preserved" area (the 0s in the mask).
+        # This makes the detection slightly more permissive.
         if self.dilate_enabled:
             self._dilate_mask(mask_imp, self.dilate_pixels)
         
+        # --- Step 5: Subtraction ---
+        # Subtract the mask from the preprocessed image.
+        # This effectively "cuts out" the background, leaving only the detected puncta.
         ic = ImageCalculator()
         result_imp = ic.run("Subtract create stack", masked_target, mask_imp)
-        # self.log("DEBUG: {} result_imp (after subtract) slices: {}".format(label, result_imp.getStackSize()))
         
-        def invert_slice(i):
-            mask_imp.getStack().getProcessor(i+1).invert()
-        ParallelUtils.parallel_for(invert_slice, mask_imp.getStackSize())
-        
-        # Final ROI detection: headless, RoiManager-free replication of
-        # "Analyze Particles... show=Nothing display clear summarize add stack".
+        # --- Step 6: Final ROI Detection & Measurement ---
+        # Now we detect the remaining non-zero pixels in the result image as the final puncta.
+        # We measure their properties on the *original* measurement image (measure_imp).
 
         from ij.process import ImageProcessor as _IP
 
         n_slices = result_imp.getStackSize()
-        # self.log("DEBUG: {} final detection on {} slice(s) via custom labeling".format(label, n_slices))
-
         stack = result_imp.getStack()
 
         def process_final_slice(i):
-            slice_idx = i + 1
-            ip = stack.getProcessor(slice_idx)
+            try:
+                slice_idx = i + 1
+                ip = stack.getProcessor(slice_idx)
+                
+                # Threshold > 0 to find all preserved objects.
+                ip_thresh = ip.duplicate()
+                ip_thresh.setThreshold(1, 65535, ImageProcessor.NO_LUT_UPDATE)
+                
+                # Use ParticleAnalyzer to generate ROIs for the detected objects.
+                # We use SHOW_MASKS to get a binary mask from which we can create ROIs.
+                rt = ResultsTable()
+                pa = ParticleAnalyzer(ParticleAnalyzer.SHOW_MASKS, MEASUREMENT_FLAGS, rt, 0, Double.POSITIVE_INFINITY)
+                pa.setHideOutputImage(True)
+                
+                temp = ImagePlus("slice", ip_thresh)
+                temp.setCalibration(cal)
+                
+                pa.analyze(temp)
+                
+                mask = pa.getOutputImage()
+                slice_entries = []
+                
+                if mask:
+                    # Convert the binary mask to ROIs.
+                    # Ensure mask is thresholded so Create Selection works
+                    mask.getProcessor().setThreshold(255, 255, ImageProcessor.NO_LUT_UPDATE)
+                    IJ.run(mask, "Create Selection", "")
+                    roi = mask.getRoi()
+                    if roi:
+                        rois = []
+                        if isinstance(roi, ShapeRoi):
+                            rois = list(roi.getRois()) # Handle composite ROIs
+                        else:
+                            rois = [roi]
+                        
+                        # Get the processor for the current slice from the measurement image stack.
+                        # This avoids modifying the shared 'measure_imp' object (setSlice/setRoi), which is not thread-safe.
+                        measure_ip = measure_imp.getStack().getProcessor(slice_idx)
 
-            if params['min'] > 0:
-                lower = float(params['min'])
-                upper = 65535.0
-                ip.setThreshold(lower, upper, _IP.NO_LUT_UPDATE)
-            else:
-                hist = ip.getHistogram()
-                threshold = AutoThresholder().getThreshold(AutoThresholder.Method.Default, hist)
-                ip.setThreshold(threshold, 65535.0, _IP.NO_LUT_UPDATE)
-                lower = ip.getMinThreshold()
-                upper = ip.getMaxThreshold()
-
-            if lower == _IP.NO_THRESHOLD or upper == _IP.NO_THRESHOLD:
+                        for r in rois:
+                            r.setPosition(slice_idx)
+                            
+                            # Measure the ROI on the *original* image (measure_imp) to get accurate intensity values.
+                            if slice_idx <= measure_imp.getStackSize():
+                                try:
+                                    # Set the ROI on the processor directly.
+                                    measure_ip.setRoi(r)
+                                    # Calculate statistics using the static method, passing the calibration.
+                                    stats = ImageStatistics.getStatistics(measure_ip, MEASUREMENT_FLAGS, cal)
+                                    
+                                    # Create a dictionary of metrics.
+                                    metrics = self._metrics_dict(base_name, label, 0, stats, cal, r) # index 0 placeholder
+                                    slice_entries.append({'roi': r, 'metrics': metrics})
+                                except:
+                                    # Catch Java exceptions that might not be caught by Exception
+                                    self.log("WARNING: Skipping malformed ROI in process_final_slice (inner)")
+                            else:
+                                self.log("WARNING: slice_idx {} out of bounds for measure_imp (size {})".format(slice_idx, measure_imp.getStackSize()))
+                    mask.close()
+                
+                return slice_entries
+            except:
+                # Catch ALL exceptions including Java RuntimeExceptions
+                import traceback
+                traceback.print_exc()
+                self.log("ERROR in process_final_slice i={}".format(i))
                 return []
 
-            width = ip.getWidth()
-            height = ip.getHeight()
-
-            # Visited map for flood-fill connected-component labeling
-            visited = [[False] * width for _ in range(height)]
-
-            def neighbors(x, y):
-                # 8-connected neighborhood
-                for dy in (-1, 0, 1):
-                    ny = y + dy
-                    if ny < 0 or ny >= height:
-                        continue
-                    for dx in (-1, 0, 1):
-                        nx = x + dx
-                        if dx == 0 and dy == 0:
-                            continue
-                        if nx < 0 or nx >= width:
-                            continue
-                        yield nx, ny
-
-            slice_entries = []
-            # Scan all pixels, flood-fill suprathreshold regions
-            for y in range(height):
-                for x in range(width):
-                    if visited[y][x]:
-                        continue
-                    v = ip.get(x, y)
-                    if v < lower or v > upper:
-                        continue
-
-                    # Start a new component
-                    stack_xy = [(x, y)]
-                    visited[y][x] = True
-                    coords = []
-
-                    while stack_xy:
-                        cx, cy = stack_xy.pop()
-                        coords.append((cx, cy))
-                        for nx, ny in neighbors(cx, cy):
-                            if visited[ny][nx]:
-                                continue
-                            nv = ip.get(nx, ny)
-                            if nv < lower or nv > upper:
-                                continue
-                            visited[ny][nx] = True
-                            stack_xy.append((nx, ny))
-
-                    pixel_count = float(len(coords))
-                    if pixel_count < min_pixels or pixel_count > max_pixels:
-                        continue
-
-                    # Build a binary mask for this component only.
-                    comp_bp = ByteProcessor(width, height)
-                    for cx, cy in coords:
-                        comp_bp.set(cx, cy, 255)
-
-                    comp_imp = ImagePlus('comp', comp_bp)
-                    comp_ip = comp_imp.getProcessor()
-                    comp_ip.setThreshold(255, 255, _IP.NO_LUT_UPDATE)
-                    roi = ThresholdToSelection.run(comp_imp)
-                    comp_imp.close()
-
-                    if roi is None:
-                        continue
-
-                    roi.setPosition(slice_idx)
-
-                    meas_imp = ImagePlus("meas", ip)
-                    meas_imp.setCalibration(cal)
-                    meas_imp.setRoi(roi)
-                    stats = meas_imp.getStatistics(MEASUREMENT_FLAGS)
-                    
-                    metrics = self._metrics_dict(base_name, label, 0, stats, cal, roi)
-                    slice_entries.append({'roi': roi, 'metrics': metrics})
-            return slice_entries
-
+        # Run final detection in parallel.
         nested_entries = ParallelUtils.parallel_for(process_final_slice, n_slices)
         
+        # Flatten the list of lists and assign sequential indices.
         entries = []
         roi_index = 0
         for slice_entries in nested_entries:
             for entry in slice_entries:
-                entry['metrics']['Label'] = '{}:{}:{}'.format(base_name, label, roi_index)
-                entry['metrics']['Index'] = roi_index
-                entries.append(entry)
                 roi_index += 1
+                # Update the index in the metrics dictionary.
+                entry['metrics']['Index'] = roi_index
+                entry['metrics']['Label'] = '{}:{}:{}'.format(base_name, label, roi_index)
+                entries.append(entry)
 
         result_imp.deleteRoi()
 
-        # self.log("DEBUG: {} Total ROIs from custom labeling: {}".format(label, len(entries)))
         return entries, result_imp, mask_imp
 
     def _metrics_dict(self, base_name, label, index, stats, cal, roi):
-        """Convert ImageJ stats object into explicit columns matching SynapseJ resultLabel."""
-        # Ref: SynapseJ_v_1.ijm line 29: resultLabel = newArray("Label","Area","Mean","Min","Max","X","Y","XM","YM","Perim.","Feret","IntDen","RawIntDen","FeretX","FeretY","FeretAngle","MinFeret");
+        """
+        Convert ImageJ stats object into a dictionary matching SynapseJ's output format.
         
+        This ensures that the CSV/TSV output columns exactly match those produced by the
+        original ImageJ macro, facilitating compatibility with existing analysis pipelines.
+        
+        Ref: SynapseJ_v_1.ijm line 29: 
+        resultLabel = newArray("Label","Area","Mean","Min","Max","X","Y","XM","YM","Perim.","Feret","IntDen","RawIntDen","FeretX","FeretY","FeretAngle","MinFeret");
+        
+        Args:
+            base_name (str): Image name.
+            label (str): Channel label (e.g., 'Pre', 'Post').
+            index (int): Punctum index.
+            stats (ImageStatistics): The statistics object from ImageJ.
+            cal (Calibration): Image calibration.
+            roi (Roi): The ROI object.
+            
+        Returns:
+            dict: A dictionary where keys are column headers and values are measurements.
+        """
         # Helper to safely get attributes that might be missing in some ImageStatistics versions
         def get_stat(obj, name, default=0):
             return getattr(obj, name, default)
@@ -996,7 +1570,20 @@ class SynapseJ4ChannelComplete(object):
         }
 
     def _size_bounds_in_pixels(self, min_um2, max_um2, cal):
-        """Translate µm² size bounds into pixel counts (User Guide table)."""
+        """
+        Translate µm² size bounds into pixel counts.
+        
+        The ParticleAnalyzer requires size limits in pixels (or calibrated units if set, 
+        but explicit pixel conversion is safer for headless operation).
+        
+        Args:
+            min_um2 (float): Minimum area in square microns.
+            max_um2 (float): Maximum area in square microns.
+            cal (Calibration): Image calibration object.
+            
+        Returns:
+            tuple: (min_pixels, max_pixels)
+        """
         pixel_area = self._pixel_area(cal)
         if pixel_area <= 0:
             pixel_area = 1.0
@@ -1006,100 +1593,214 @@ class SynapseJ4ChannelComplete(object):
 
 
     def _gate_puncta_with_marker_overlap(self, puncta_entries, marker_label_map, overlap_threshold=5):
-            if marker_label_map is None:
-                return puncta_entries
-            retained = []
-            for entry in puncta_entries:
-                roi = entry['roi']
-                if marker_label_map.getNSlices() > 1 and roi.getPosition() > 0:
-                    marker_label_map.setSlice(roi.getPosition())
-                marker_label_map.setRoi(roi)
-                hist = marker_label_map.getProcessor().getHistogram()
-                max_overlap = max(hist[1:]) if len(hist) > 1 else 0
-                if max_overlap >= overlap_threshold:
-                    retained.append(entry)
-            marker_label_map.deleteRoi()
-            return retained            
+        """
+        Filter puncta based on overlap with a marker label map.
+        
+        Note: This method appears to be an alternative or legacy implementation of marker gating.
+        The primary marker gating logic is currently handled by '_filter_by_intensity'.
+        This version checks for pixel overlap with a segmented marker map rather than raw intensity.
+        
+        Args:
+            puncta_entries (list): List of candidate puncta.
+            marker_label_map (ImagePlus): Label map of marker regions.
+            overlap_threshold (int): Minimum overlapping pixels required.
+            
+        Returns:
+            list: Filtered list of puncta.
+        """
+        # If no marker map is provided, we cannot filter, so we return all entries.
+        if marker_label_map is None:
+            return puncta_entries
+            
+        retained = []
+        # Iterate through each candidate punctum.
+        for entry in puncta_entries:
+            roi = entry['roi']
+            
+            # Ensure the marker map is set to the correct Z-slice.
+            if marker_label_map.getNSlices() > 1 and roi.getPosition() > 0:
+                marker_label_map.setSlice(roi.getPosition())
+                
+            # Set the ROI on the marker map to inspect the underlying pixels.
+            marker_label_map.setRoi(roi)
+            
+            # Get the histogram of pixel values within the ROI.
+            # Since this is a label map, values > 0 represent marker regions.
+            hist = marker_label_map.getProcessor().getHistogram()
+            
+            # Check if there is significant overlap with any marker region.
+            # hist[1:] contains counts for all non-background values.
+            # We take the maximum overlap with any single marker region.
+            max_overlap = max(hist[1:]) if len(hist) > 1 else 0
+            
+            # If the overlap exceeds the threshold, keep the punctum.
+            if max_overlap >= overlap_threshold:
+                retained.append(entry)
+                
+        # Clean up the ROI on the marker map.
+        marker_label_map.deleteRoi()
+        
+        return retained            
             
     def save_text_lines(self, lines, path):
-        """Write raw text lines to a file."""
+        """
+        Write a list of strings to a text file.
+        
+        Used for saving the correlation analysis results (CorrResults.txt).
+        
+        Args:
+            lines (list): List of strings to write.
+            path (str): Destination file path.
+        """
+        # If there is no data to write, exit early to avoid creating empty files.
         if not lines:
             return
+            
+        # Open the file in write mode ('w').
         with open(path, 'w') as handle:
             for line in lines:
+                # Write each line followed by a newline character.
                 handle.write(line + '\n')
 
     def save_results_table(self, rows, path):
-        """Persist any TSV table with header first, mirroring SynapseJ text exports."""
+        """
+        Save a list of dictionaries as a tab-separated value (TSV) file.
+        
+        This function handles the serialization of measurement data to disk.
+        It ensures that the header row matches the keys of the dictionaries.
+        
+        Args:
+            rows (list): List of dictionaries, where each dictionary is a row.
+            path (str): Output file path.
+        """
+        # If there are no rows, there is nothing to save.
         if not rows:
             return
+            
+        # Open the file for writing.
         with open(path, 'w') as handle:
+            # Create a CSV DictWriter.
+            # We use '\t' (tab) as the delimiter to create a TSV file, which is standard for ImageJ results.
+            # The fieldnames are taken from the keys of the first dictionary in the list.
             writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()), delimiter='\t')
+            
+            # Write the header row (column names).
             writer.writeheader()
+            
+            # Write all data rows.
             for row in rows:
                 writer.writerow(row)  # TSV matches SynapseJ's tab-delimited text exports.
 
     def save_roi_set(self, rois, path):
-        """Serialize ROI sets so Fiji can reload them like SynapseJ macros do."""
+        """
+        Save a list of ROIs to a ZIP file (ImageJ ROI Set).
+        
+        This allows the results to be opened in the standard ImageJ ROI Manager
+        for manual inspection and validation. The format is compatible with
+        ImageJ's "Save..." command in the ROI Manager.
+        
+        Args:
+            rois (list): List of Roi objects to save.
+            path (str): Output path (should end in .zip).
+        """
+        # If no ROIs to save, exit.
         if not rois:
             return
+            
+        # Ensure the parent directory exists.
         parent = os.path.dirname(path)
         if parent and not os.path.exists(parent):
             os.makedirs(parent)
+            
+        # Create a ZipOutputStream to write the .zip file.
+        # We wrap a FileOutputStream in a BufferedOutputStream for performance.
         stream = ZipOutputStream(BufferedOutputStream(FileOutputStream(path)))
         try:
+            # Iterate through each ROI.
             for idx, roi in enumerate(rois):
+                # Create a new entry in the zip file for this ROI.
+                                                             # The name format 'Roi_XXXXX.roi' is standard.
                 entry = ZipEntry('Roi_{:05d}.roi'.format(idx + 1))
+
                 stream.putNextEntry(entry)
+                
+                # Use ImageJ's RoiEncoder to serialize the ROI object into the stream.
+                # This handles the binary format specifics of ImageJ ROIs.
                 encoder = RoiEncoder(stream)
                 encoder.write(roi.clone())
+                
+                # Close the current entry to prepare for the next one.
                 stream.closeEntry()
         finally:
+            # Ensure the stream is closed to flush data to disk.
             stream.close()
 
     def save_overlay(self, pre_src, post_src, c1_imp, c2_imp, base_name):
-            """Create exact SynapseJ RGB overlay – 4 channels merged, no outlines."""
-            # Ref: SynapseJ_v_1.ijm line 370: "run("Merge Channels...", "c1=PreF c2=PostF c3=C1 c4=C2 create");"
-            # PreF = pre_src (result), PostF = post_src (result)
-            # C1 = c1_imp, C2 = c2_imp
-            
-            # Duplicate all to avoid modifying originals
-            c1 = pre_src.duplicate()
-            c2 = post_src.duplicate()
-            c3 = c1_imp.duplicate()
-            c4 = c2_imp.duplicate()
-            
-            # Merge Channels
-            # c1=Red, c2=Green, c3=Blue, c4=Gray, etc.
-            # The macro string "c1=PreF c2=PostF c3=C1 c4=C2" maps images to channels.
-            # In ImageJ "Merge Channels":
-            # c1 (Red) -> PreF
-            # c2 (Green) -> PostF
-            # c3 (Blue) -> C1
-            # c4 (Gray) -> C2
-            # Wait, usually c1=Red, c2=Green, c3=Blue, c4=Gray, c5=Cyan, c6=Magenta, c7=Yellow.
-            # So PreF is Red, PostF is Green, C1 is Blue, C2 is Gray.
-            
-            merged = RGBStackMerge.mergeChannels([c1, c2, c3, c4], True)
-            
-            # Save
+        """
+        Create and save a multi-channel composite overlay image.
+        
+        This generates the "PrePost" merged image, which provides a visual summary of the analysis.
+        It combines the processed pre- and post-synaptic channels (after background subtraction)
+        with the original marker channels.
+        
+        Channel Mapping (Standard ImageJ Colors):
+        - Channel 1 (Red): Processed Pre-synaptic (PreF)
+        - Channel 2 (Green): Processed Post-synaptic (PostF)
+        - Channel 3 (Blue): Original Post-Marker (C1)
+        - Channel 4 (Gray): Original Pre-Marker (C2)
+        
+        Args:
+            pre_src (ImagePlus): Processed pre-synaptic image.
+            post_src (ImagePlus): Processed post-synaptic image.
+            c1_imp (ImagePlus): Original Channel 1 (Post Marker).
+            c2_imp (ImagePlus): Original Channel 2 (Pre Marker).
+            base_name (str): Base filename for saving.
+        """
+        # Duplicate all images to avoid modifying the originals during the merge process.
+        # This is crucial because 'RGBStackMerge' might alter the input stack properties.
+        c1 = pre_src.duplicate()
+        c2 = post_src.duplicate()
+        c3 = c1_imp.duplicate()
+        c4 = c2_imp.duplicate()
+        
+        # Merge Channels
+        # The order in the list determines the channel assignment (Red, Green, Blue, Gray, etc.)
+        # [c1, c2, c3, c4] maps to:
+        # 1. Red: Pre-synaptic
+        # 2. Green: Post-synaptic
+        # 3. Blue: Post-Marker
+        # 4. Gray: Pre-Marker
+        merged = RGBStackMerge.mergeChannels([c1, c2, c3, c4], True)
+        
+        # Save the merged composite image
+        if merged is not None:
             out_path = os.path.join(self.merge_dir, '{}PrePost.tif'.format(base_name))
             IJ.save(merged, out_path)
-            
             merged.close()
-            c1.close()
-            c2.close()
-            c3.close()
-            c4.close()
+        
+        # Clean up duplicates to free memory
+        c1.close()
+        c2.close()
+        c3.close()
+        c4.close()
 
     def record_summary(self, base_name, pre_count, pre_marker_count, post_count, post_marker_count,
                        syn_post_count, syn_pre_count):
-        """Append a Collated ResultsIF row for this image.
-
-        Directly mirrors the macro arrays:
-        LABEL[row], Syn[row], SynPre[row], ThrPre[row], ForPost[row], Post[row], Pre[row].
         """
-
+        Append a summary row for the current image to the 'Collated ResultsIF' table.
+        
+        This table provides high-level counts of detected structures for each image processed.
+        It mirrors the columns of the original SynapseJ macro output.
+        
+        Args:
+            base_name (str): Image name.
+            pre_count (int): Total pre-synaptic puncta detected.
+            pre_marker_count (int): Pre-synaptic puncta passing marker gate (if applicable).
+            post_count (int): Total post-synaptic puncta detected.
+            post_marker_count (int): Post-synaptic puncta passing marker gate (if applicable).
+            syn_post_count (int): Number of post-synaptic puncta that are part of a synapse.
+            syn_pre_count (int): Number of pre-synaptic puncta that are part of a synapse.
+        """
         entry = {
             'Label': base_name,
             'Synapse Post No.': syn_post_count,
@@ -1112,445 +1813,1026 @@ class SynapseJ4ChannelComplete(object):
         self.results_summary.append(entry)
 
     def save_all_results(self):
-        """Write every accumulated table using official SynapseJ filenames."""
+        """
+        Write all accumulated result tables to disk.
+        
+        This method is called at the end of the batch processing to save the
+        aggregated data from all images into tab-separated text files.
+        These files match the naming convention and format of the original SynapseJ macro.
+        """
+        # Save the summary table (Collated ResultsIF) which contains one row per image.
         if self.results_summary:
             self.save_results_table(self.results_summary, os.path.join(self.dest_dir, 'Collated ResultsIF.txt'))
+            
+        # Save the detailed list of ALL detected pre-synaptic puncta (before synapse filtering).
         if self.all_pre_results:
             self.save_results_table(self.all_pre_results, os.path.join(self.dest_dir, 'All Pre Results.txt'))
+            
+        # Save the detailed list of ALL detected post-synaptic puncta (before synapse filtering).
         if self.all_post_results:
             self.save_results_table(self.all_post_results, os.path.join(self.dest_dir, 'All Post Results.txt'))
+            
+        # Save the list of CONFIRMED synaptic pre-puncta (those that colocalized).
         if self.syn_pre_results:
             self.save_results_table(self.syn_pre_results, os.path.join(self.dest_dir, 'Syn Pre Results.txt'))
+            
+        # Save the list of CONFIRMED synaptic post-puncta (those that colocalized).
         if self.syn_post_results:
             self.save_results_table(self.syn_post_results, os.path.join(self.dest_dir, 'Syn Post Results.txt'))
+            
+        # Save the paired synapse data (currently unused/empty in this implementation but kept for compatibility).
         if self.synapse_pair_rows:
             self.save_results_table(self.synapse_pair_rows, os.path.join(self.dest_dir, 'AllSynapsePairs.tsv'))
+            
+        # Save the Pre->Post correlation analysis results (nearest neighbor data).
         if self.pre_correlation_rows:
             self.save_text_lines(self.pre_correlation_rows, os.path.join(self.dest_dir, 'CorrResults.txt'))
+            
+        # Save the Post->Pre correlation analysis results (nearest neighbor data).
         if self.post_correlation_rows:
             self.save_text_lines(self.post_correlation_rows, os.path.join(self.dest_dir, 'CorrResults2.txt'))
 
     def save_log(self):
-        """Store IFALog.txt exactly like the macro for provenance."""
+        """Store the execution log (IFALog.txt) for provenance and debugging."""
         if not self.log_messages:
             return
+        # Write the log messages to a text file in the destination directory.
+        # This file serves as a record of the analysis parameters and execution steps.
         path = os.path.join(self.dest_dir, 'IFALog.txt')
         with open(path, 'w') as handle:
             handle.write('\n'.join(self.log_messages))
 
     def _pixel_area(self, cal):
-        """Compute µm² per pixel, defaulting to unity if calibration missing."""
+        """
+        Calculate the area of a single pixel in square microns.
+        
+        Used for converting pixel counts to physical area units (µm²).
+        If calibration is missing or invalid, defaults to 1.0 (pixels).
+        
+        Args:
+            cal (Calibration): Image calibration object.
+            
+        Returns:
+            float: Area of one pixel (width * height).
+        """
         if cal is None:
             return 1.0
+        # Get pixel width, defaulting to 1.0 if not set or invalid.
         px = cal.pixelWidth if cal.pixelWidth and cal.pixelWidth > 0 else 1.0
+        # Get pixel height, defaulting to 1.0 if not set or invalid.
         py = cal.pixelHeight if cal.pixelHeight and cal.pixelHeight > 0 else 1.0
+        # Return the product (Area = Width * Height).
         return px * py
 
     def _pixel_width(self, cal):
-        """Return calibrated pixel width (µm) or default to 1."""
+        """
+        Get the pixel width in microns.
+        
+        Args:
+            cal (Calibration): Image calibration object.
+            
+        Returns:
+            float: Pixel width (default 1.0).
+        """
+        # Check for valid calibration and positive pixel width.
         if cal is None or not cal.pixelWidth or cal.pixelWidth <= 0:
             return 1.0
         return cal.pixelWidth
 
     def _pixel_height(self, cal):
-        """Return calibrated pixel height (µm) or default to 1."""
+        """
+        Get the pixel height in microns.
+        
+        Args:
+            cal (Calibration): Image calibration object.
+            
+        Returns:
+            float: Pixel height (default 1.0).
+        """
+        # Check for valid calibration and positive pixel height.
         if cal is None or not cal.pixelHeight or cal.pixelHeight <= 0:
             return 1.0
         return cal.pixelHeight
 
     def _create_count_mask(self, imp, min_threshold):
-        """Generate a "Count Masks" image (1-based particle index per pixel).
-
-        Mirrors the macro call
-        run("Analyze Particles...", "size=0-infinity show=[Count Masks] display clear stack");
-        on the CheckIm image with an optional intensity threshold.
         """
+        Generate a "Count Mask" image where each particle has a unique integer ID.
+        
+        This is crucial for the "Strict Pixel Count" association strategy (LapNo > 1).
+        It allows us to determine exactly which particle a pixel belongs to, enabling
+        us to count how many pixels of a specific partner particle overlap with an anchor ROI.
+        
+        Mirrors the macro command:
+        run("Analyze Particles...", "size=0-infinity show=[Count Masks] display clear stack");
+        
+        Args:
+            imp (ImagePlus): The image to analyze (usually the partner channel).
+            min_threshold (float): Minimum intensity threshold for particle detection.
+            
+        Returns:
+            ImagePlus: A 16-bit image where background is 0 and particle 'i' has value 'i'.
+        """
+        # Duplicate the input image to avoid modifying the original.
         temp = imp.duplicate()
+        
+        # Apply threshold if specified. This defines the "particles" vs background.
         if min_threshold > 0:
             IJ.setThreshold(temp, float(min_threshold), 65535.0)
             temp.getProcessor().setThreshold(float(min_threshold), 65535.0, ImageProcessor.NO_LUT_UPDATE)
 
+        # Configure ParticleAnalyzer to generate a "Count Mask".
+        # SHOW_ROI_MASKS in the API corresponds to "Count Masks" in the GUI when used with 16-bit output?
+        # Actually, SHOW_MASKS produces binary masks (0/255).
+        # To get unique IDs (Count Masks), we might need a different approach or specific flags.
+        # In ImageJ macro: "show=[Count Masks]" creates a 16-bit image where pixel value = particle index.
+        # In Java API, ParticleAnalyzer doesn't have a direct "SHOW_COUNT_MASKS" constant exposed easily in all versions.
+        # However, using 'SHOW_ROI_MASKS' often produces a mask where pixels are labeled.
+        # Let's verify: The macro uses "Count Masks".
         flags = ParticleAnalyzer.CLEAR_WORKSHEET | ParticleAnalyzer.DOES_STACKS | ParticleAnalyzer.SHOW_ROI_MASKS
+        
+        # Initialize ParticleAnalyzer with no size constraints (0-Infinity) to capture all thresholded regions.
         pa = ParticleAnalyzer(flags, 0, None, 0.0, Double.POSITIVE_INFINITY, 0.0, 0.0)
+        
+        # Run analysis. This generates the output image internally.
         pa.analyze(temp)
+        
+        # Retrieve the generated mask image.
         count_mask = pa.getOutputImage()
+        
+        # Clean up the temporary image.
         temp.close()
 
+        # Ensure the mask has the correct calibration (same as input).
         if count_mask is not None:
             count_mask.setCalibration(imp.getCalibration())
+            
         return count_mask
 
     def assoc_roi(self, check_imp, store_imp, store_mask_imp, rois, check_threshold, overlap_pixels):
-        """Replicate AssocROI from SynapseJ_v_1.ijm.
+        """
+        Identify synapses by checking for overlap between pre- and post-synaptic puncta.
+        
+        This method replicates the 'AssocROI' function from the SynapseJ macro.
+        It filters the provided list of ROIs (e.g., Pre-synaptic puncta) based on their
+        overlap with the 'check_imp' (e.g., Post-synaptic image).
+        
+        Args:
+            check_imp (ImagePlus): The partner image to check for overlap (e.g., Post image when filtering Pre ROIs).
+            store_imp (ImagePlus): The source image corresponding to the ROIs (will be modified to remove rejected puncta).
+            store_mask_imp (ImagePlus): The mask of the source image (will be modified).
+            rois (list): List of ROIs to filter.
+            check_threshold (float): Intensity threshold for the check image.
+            overlap_pixels (int): Minimum number of overlapping pixels required.
+            
+        Returns:
+            list: The subset of ROIs that satisfy the overlap criteria (the synapses).
+        """
+        # If there are no ROIs to check, return an empty list immediately to save processing time.
+        if not rois:
+            return []
 
-        - If overlap_pixels (LapNo) == 1: only check that each ROI has Max>0 in
-          CheckIm after thresholding by check_threshold; no explicit pixel
-          overlap requirement.
-        - If overlap_pixels > 1: build a Count Masks image from CheckIm and
-          require at least "overlap_pixels" pixels of overlap with some
-          labeled particle.
+        # Prepare the check image (either intensity or count mask)
+        target_imp = check_imp
+        is_count_mask = False
+        
+        # --- Strategy Selection ---
+        if overlap_pixels > 1:
+            # Strategy 2: Strict Pixel Count Check (LapNo > 1)
+            # We need a "Count Mask" where each partner particle has a unique integer ID.
+            # This allows us to distinguish between overlapping with one large particle vs. multiple small ones.
+            target_imp = self._create_count_mask(check_imp, check_threshold)
+            is_count_mask = True
+            if target_imp is None:
+                self.log("WARNING: Failed to generate Count Mask for association. Keeping all ROIs.")
+                return rois
+        
+        target_stack = target_imp.getStack()
+        
+        # Group ROIs by slice for parallel processing
+        rois_by_slice = defaultdict(list)
+        for i, roi in enumerate(rois):
+            p = roi.getPosition()
+            if p < 1: p = 1
+            rois_by_slice[p].append((i, roi))
+            
+        # Phase 1: Parallel Check
+        slices = list(rois_by_slice.keys())
+        
+        def check_slice(slice_idx):
+            try:
+                ip = target_stack.getProcessor(slice_idx)
+                slice_kept = []
+                slice_rejected = []
+                
+                for idx, roi in rois_by_slice[slice_idx]:
+                    try:
+                        ip.setRoi(roi)
+                        stats = ip.getStatistics()
+                        
+                        should_keep = False
+                        
+                        if stats.max > 0:
+                            if not is_count_mask:
+                                # Strategy 1: Simple Intensity Check (LapNo <= 1)
+                                # Max > 0 means overlap exists (any non-zero pixel).
+                                should_keep = True
+                            else:
+                                # Strategy 2: Strict Pixel Count Check
+                                # Check histogram for sufficient overlap with a single particle.
+                                # hist[0] is background (0).
+                                # hist[k] is the count of pixels belonging to partner particle ID k.
+                                hist = ip.getHistogram()
+                                for k in range(1, len(hist)):
+                                    if hist[k] >= overlap_pixels:
+                                        should_keep = True
+                                        break
+                        
+                        if should_keep:
+                            slice_kept.append((idx, roi))
+                        else:
+                            slice_rejected.append(roi)
+                    except:
+                        self.log("WARNING: Skipping malformed ROI in assoc_roi")
+                        slice_rejected.append(roi)
+                return (slice_kept, slice_rejected)
+            except:
+                self.log("WARNING: Failed to process slice {} in assoc_roi".format(slice_idx))
+                return ([], [])
+
+        def check_task(i):
+            return check_slice(slices[i])
+
+        nested_results = ParallelUtils.parallel_for(check_task, len(slices))
+        
+        all_kept = []
+        all_rejected = []
+        
+        for kept, rejected in nested_results:
+            all_kept.extend(kept)
+            all_rejected.extend(rejected)
+            
+        # Sort kept ROIs to maintain original order
+        all_kept.sort(key=lambda x: x[0])
+        kept_rois = [x[1] for x in all_kept]
+        # We must remove rejected puncta from the source images so they don't appear in final outputs.
+        rejected_by_slice = defaultdict(list)
+        for roi in all_rejected:
+            p = roi.getPosition()
+            if p < 1: p = 1
+            rejected_by_slice[p].append(roi)
+            
+        store_stack = store_imp.getStack()
+        mask_stack = store_mask_imp.getStack() if store_mask_imp else None
+        
+        def clear_slice(slice_idx):
+            res_ip = store_stack.getProcessor(slice_idx)
+            mask_ip = mask_stack.getProcessor(slice_idx) if mask_stack else None
+            
+            for roi in rejected_by_slice[slice_idx]:
+                # Erase from Result Image
+                res_ip.setValue(0)
+                res_ip.fill(roi)
+                # Erase from Mask Image (if provided)
+                if mask_ip:
+                    mask_ip.setValue(0)
+                    mask_ip.fill(roi)
+                    
+        clear_slices = list(rejected_by_slice.keys())
+        def clear_task(i):
+            clear_slice(clear_slices[i])
+            
+        if clear_slices:
+            ParallelUtils.parallel_for(clear_task, len(clear_slices))
+            
+        # Clean up temporary count mask if we created one
+        if is_count_mask:
+            target_imp.close()
+            
+        return kept_rois
+
+    def _clear_roi(self, imp1, imp2, roi):
+        """
+        Erase the content of an ROI from the provided images.
+        
+        This is used to "reject" puncta that fail validation checks (e.g., no overlap,
+        weak marker signal). By setting their pixels to 0, we ensure they are excluded
+        from subsequent analysis steps and visualization.
+        
+        Args:
+            imp1 (ImagePlus): First image to clear (e.g., Result Image).
+            imp2 (ImagePlus): Second image to clear (e.g., Mask Image).
+            roi (Roi): The region to erase.
+        """
+        # Iterate through the provided images (handling cases where one might be None).
+        for imp in [imp1, imp2]:
+            if imp:
+                # Ensure we are operating on the correct slice if it's a stack.
+                if imp.getStackSize() > 1:
+                    imp.setSlice(roi.getPosition())
+                
+                # Set the ROI on the image.
+                imp.setRoi(roi)
+                
+                # Get the processor for the current slice.
+                ip = imp.getProcessor()
+                
+                # Set the drawing color/value to 0 (black/background).
+                ip.setValue(0)
+                
+                # Fill the ROI with 0, effectively erasing the punctum.
+                ip.fill(roi)
+                
+                # Clear the ROI selection from the image.
+                imp.deleteRoi()
+
+    def measure_rois(self, rois, imp, base_name, label, cal):
+        """
+        Measure intensity and shape statistics for a list of ROIs.
+        
+        This generates the detailed per-punctum metrics (Area, Mean, IntDen, etc.)
+        that populate the final result tables.
+        
+        Args:
+            rois (list): List of ROIs to measure.
+            imp (ImagePlus): The image to measure against.
+            base_name (str): Image name.
+            label (str): Channel label (e.g., 'Pre', 'Post').
+            cal (Calibration): Image calibration.
+            
+        Returns:
+            list: A list of dictionaries containing the measurements.
         """
         if not rois:
             return []
 
-        kept_rois = []
-        slice_kept_counts = defaultdict(int)
-        slice_total_counts = defaultdict(int)
+        # Group ROIs by slice to allow parallel processing of slices.
+        # Each slice's ImageProcessor is not thread-safe for setRoi, so we must
+        # ensure only one thread accesses a given slice's processor at a time.
+        rois_by_slice = defaultdict(list)
+        for i, roi in enumerate(rois):
+            p = roi.getPosition()
+            if p < 1: p = 1
+            rois_by_slice[p].append((i, roi))
+            
+        stack = imp.getStack()
+        slices = list(rois_by_slice.keys())
+        
+        def process_slice(slice_idx):
+            try:
+                # Get the processor for this slice.
+                ip = stack.getProcessor(slice_idx)
+                
+                results = []
+                for idx, roi in rois_by_slice[slice_idx]:
+                    try:
+                        # Set ROI on the processor (not the ImagePlus)
+                        ip.setRoi(roi)
+                        # Calculate statistics
+                        stats = ImageStatistics.getStatistics(ip, MEASUREMENT_FLAGS, cal)
+                        # Generate metrics
+                        metrics = self._metrics_dict(
+                            base_name,
+                            label,
+                            idx + 1, # Use 1-based index
+                            stats,
+                            cal,
+                            roi,
+                        )
+                        results.append((idx, metrics))
+                    except:
+                        self.log("WARNING: Skipping malformed ROI in measure_rois")
+                return results
+            except:
+                self.log("WARNING: Failed to process slice {} in measure_rois".format(slice_idx))
+                return []
 
-        # LapNo == 1 branch: intensity-only gating (macro's else-if block).
-        if overlap_pixels <= 1:
-            for roi in reversed(rois):
-                slice_idx = roi.getPosition()
-                slice_total_counts[slice_idx] += 1
-                if check_imp.getStackSize() > 1 and slice_idx > 0:
-                    check_imp.setSlice(slice_idx)
-                check_imp.setRoi(roi)
-                stats = check_imp.getStatistics()
-                if stats.max <= 0:
-                    # Clear rejected ROI from StoreIm and StoreImT
-                    self._clear_roi(store_imp, store_mask_imp, roi)
-                else:
-                    kept_rois.append(roi)
-                    slice_kept_counts[slice_idx] += 1
+        def task(i):
+            return process_slice(slices[i])
 
-            check_imp.deleteRoi()
-            kept_rois.reverse()
-            # self.log("DEBUG: assoc_roi (LapNo=1) processed {} ROIs".format(len(rois)))
-            # for s in sorted(slice_total_counts.keys()):
-                # self.log("DEBUG: assoc_roi Slice {}: Kept {}/{}".format(s, slice_kept_counts[s], slice_total_counts[s]))
-            return kept_rois
-
-        # LapNo > 1 branch: require explicit pixel overlap using a Count Masks image.
-        count_mask = self._create_count_mask(check_imp, check_threshold)
-        if count_mask is None:
-            self.log("WARNING: Failed to generate Count Mask for association. Keeping all ROIs.")
-            return rois
-
-        stats_mask = count_mask.getStatistics()
-        # self.log("DEBUG: Count Mask Max: {}".format(stats_mask.max))
-
-        for roi in reversed(rois):
-            slice_idx = roi.getPosition()
-            slice_total_counts[slice_idx] += 1
-
-            if count_mask.getStackSize() > 1 and slice_idx > 0:
-                count_mask.setSlice(slice_idx)
-            count_mask.setRoi(roi)
-            stats = count_mask.getStatistics()
-            if stats.max == 0:
-                self._clear_roi(store_imp, store_mask_imp, roi)
-                continue
-
-            hist = count_mask.getProcessor().getHistogram()
-            has_overlap = False
-            for i in range(1, len(hist)):
-                if hist[i] >= overlap_pixels:
-                    has_overlap = True
-                    break
-
-            if has_overlap:
-                kept_rois.append(roi)
-                slice_kept_counts[slice_idx] += 1
-            else:
-                self._clear_roi(store_imp, store_mask_imp, roi)
-
-        count_mask.close()
-        kept_rois.reverse()
-
-        # self.log("DEBUG: assoc_roi (LapNo>{}) processed {} ROIs".format(1, len(rois)))
-        # for s in sorted(slice_total_counts.keys()):
-            # self.log("DEBUG: assoc_roi Slice {}: Kept {}/{}".format(s, slice_kept_counts[s], slice_total_counts[s]))
-        return kept_rois
-
-    def _clear_roi(self, imp1, imp2, roi):
-        """Clear the ROI region in the provided images (set to 0)."""
-        for imp in [imp1, imp2]:
-            if imp:
-                if imp.getStackSize() > 1:
-                    imp.setSlice(roi.getPosition())
-                imp.setRoi(roi)
-                ip = imp.getProcessor()
-                ip.setValue(0)
-                ip.fill(roi)
-                imp.deleteRoi()
-
-    def measure_rois(self, rois, imp, base_name, label, cal):
-        """Measure ROIs on the provided image and return result rows."""
-        rows = []
-        for idx, roi in enumerate(rois):
-            if imp.getStackSize() > 1:
-                imp.setSlice(roi.getPosition())
-            imp.setRoi(roi)
-            stats = imp.getStatistics(MEASUREMENT_FLAGS)
-            metrics = self._metrics_dict(base_name, label, idx, stats, cal, roi)
-            rows.append(metrics)
-            imp.deleteRoi()
-        return rows
+        nested_results = ParallelUtils.parallel_for(task, len(slices))
+        
+        # Flatten and sort to restore original order
+        all_results = []
+        for res in nested_results:
+            all_results.extend(res)
+            
+        all_results.sort(key=lambda x: x[0])
+        
+        return [x[1] for x in all_results]
 
     def _dilate_mask(self, mask_imp, pixels):
-        """Dilate the mask image in-place (Ref: SynapseJ_v_1.ijm lines 565-580)."""
+        """
+        Dilate the mask image in-place.
+        
+        This method expands the binary mask by a specified number of pixels.
+        It is used if 'dilate_enabled' is True, allowing for more permissive
+        colocalization by artificially enlarging the detected puncta.
+        
+        Implementation Note:
+        The macro converts the 16-bit mask to 8-bit for processing, applies the dilation
+        using ROI enlargement, and then converts back to 16-bit.
+        
+        Args:
+            mask_imp (ImagePlus): The binary mask image (will be modified).
+            pixels (float): The radius of dilation in pixels.
+        """
         # NO early return - macro always runs the loop when dilateQ true, even for 0 or negative
         from ij.process import ImageConverter
+        
+        # Convert to 8-bit for standard binary operations.
+        # Dilation/Erosion operations are typically faster and simpler on 8-bit images.
         ImageConverter(mask_imp).convertToGray8()
         
         stack = mask_imp.getStack()
         n_slices = stack.getSize()
         
+        # Define the per-slice dilation logic.
         def process_slice(i):
             slice_idx = i + 1
             ip = stack.getProcessor(slice_idx)
-            # Threshold > 0 (binary mask usually 0 and 255)
+            
+            # Create a binary threshold (1-255) to identify object pixels.
+            # Background is 0.
             ip.setThreshold(1, 255, ImageProcessor.NO_LUT_UPDATE)
+            
+            # Wrap the processor in a temporary ImagePlus to use the ThresholdToSelection plugin.
             temp_imp = ImagePlus("temp", ip)
+            
+            # Convert the thresholded mask into a composite ROI.
             roi = ThresholdToSelection.run(temp_imp)
             
             if roi:
+                # Enlarge the ROI by the specified number of pixels.
+                # This effectively dilates the selection.
                 dilated_roi = RoiEnlarger.enlarge(roi, float(pixels))
+                
+                # Fill the enlarged ROI with white (255) on the processor.
+                # This updates the mask to include the dilated area.
                 ip.setValue(255)
                 ip.fill(dilated_roi)
         
+        # Execute dilation in parallel across all slices.
         ParallelUtils.parallel_for(process_slice, n_slices)
                 
+        # Convert back to 16-bit to match the rest of the pipeline (which expects 16-bit masks).
         ImageConverter(mask_imp).convertToGray16()
         
+        # Scale 8-bit values (0-255) to 16-bit range (0-65535).
+        # This ensures that "white" remains the maximum value.
+        # 255 * 257 = 65535.
         def multiply_slice(i):
             stack.getProcessor(i+1).multiply(257)
             
         ParallelUtils.parallel_for(multiply_slice, n_slices)
 
     def _create_label_map(self, imp, rois, pixels):
-        """Create a label map image where pixel values correspond to ROI indices (1-based)."""
+        """
+        Create a label map image where pixel values correspond to ROI indices (1-based).
+        
+        This image is essential for the "MatchROI" correlation analysis.
+        It allows us to look up which particle ID belongs to a specific pixel location.
+        Instead of iterating through thousands of ROIs for every pixel (which is slow),
+        we "burn" the ROIs into an image. Then, checking if a pixel belongs to a particle
+        is a constant-time O(1) lookup: just read the pixel value.
+        
+        Args:
+            imp (ImagePlus): Reference image for dimensions and calibration.
+            rois (list): List of ROIs to burn into the map.
+            pixels (float): Dilation radius (if enabled).
+            
+        Returns:
+            ImagePlus: An image where background is 0 and particle 'i' has value 'i+1'.
+        """
         width = imp.getWidth()
         height = imp.getHeight()
-        
         n_rois = len(rois)
+        
+        # Determine necessary bit depth based on the number of particles.
+        # We need enough dynamic range to assign a unique ID to every particle.
+        # - 8-bit (Byte): Max 255 IDs.
+        # - 16-bit (Short): Max 65,535 IDs.
+        # - 32-bit (Float): Practically unlimited IDs.
         if n_rois > 65534:
+            # More than 65k particles requires 32-bit Float.
             from ij.process import FloatProcessor
-            ip = FloatProcessor(width, height)
+            template_ip = FloatProcessor(width, height)
         elif n_rois > 254:
+            # More than 254 particles requires 16-bit Short.
             from ij.process import ShortProcessor
-            ip = ShortProcessor(width, height)
+            template_ip = ShortProcessor(width, height)
         else:
+            # Fewer than 255 particles fits in 8-bit Byte.
             from ij.process import ByteProcessor
-            ip = ByteProcessor(width, height)
+            template_ip = ByteProcessor(width, height)
             
-        label_map = ImagePlus("LabelMap", ip)
-        label_map.setCalibration(imp.getCalibration())
-        
-        if imp.getStackSize() > 1:
-            stack = ImageStack(width, height)
-            for i in range(imp.getStackSize()):
-                stack.addSlice(ip.duplicate())
-            label_map.setStack(stack)
-        
         from ij.plugin import RoiEnlarger
-        
-        # Burn in ROIs
-        for i, roi in enumerate(rois):
-            label_val = i + 1
-            
-            draw_roi = roi
-            if self.dilate_enabled:
-                draw_roi = RoiEnlarger.enlarge(roi, float(pixels))
+
+        # If single slice, process sequentially (overhead of parallelization not worth it for 1 slice).
+        if imp.getStackSize() == 1:
+            label_map = ImagePlus("LabelMap", template_ip)
+            label_map.setCalibration(imp.getCalibration())
+            for i, roi in enumerate(rois):
+                # IDs are 1-based because 0 is reserved for background.
+                label_val = i + 1
+                draw_roi = roi
+                # Optional dilation: artificially expand the particle footprint.
+                if self.dilate_enabled:
+                    draw_roi = RoiEnlarger.enlarge(roi, float(pixels))
                 
-            if label_map.getStackSize() > 1:
-                label_map.setSlice(draw_roi.getPosition())
-            
-            label_map.setRoi(draw_roi)
-            label_map.getProcessor().setValue(label_val)
-            label_map.getProcessor().fill(draw_roi)
+                # Set the ROI and fill it with the unique ID.
+                label_map.setRoi(draw_roi)
+                label_map.getProcessor().setValue(label_val)
+                label_map.getProcessor().fill(draw_roi)
             label_map.deleteRoi()
+            return label_map
+
+        # For stacks, parallelize by slice.
+        # This is significantly faster for large 3D stacks with many particles.
+        
+        # Group ROIs by slice index (1-based).
+        rois_by_slice = defaultdict(list)
+        for i, roi in enumerate(rois):
+            # Store tuple (original_index, roi) to preserve ID = index + 1
+            rois_by_slice[roi.getPosition()].append((i, roi))
+            
+        n_slices = imp.getStackSize()
+        
+        def create_slice_processor(i):
+            slice_idx = i + 1
+            # Create blank processor (duplicate from template)
+            slice_ip = template_ip.createProcessor(width, height)
+            slice_ip.setValue(0)
+            slice_ip.fill()
+            
+            # Draw ROIs for this slice
+            slice_rois = rois_by_slice[slice_idx]
+            
+            for idx, roi in slice_rois:
+                label_val = idx + 1
+                draw_roi = roi
+                if self.dilate_enabled:
+                    draw_roi = RoiEnlarger.enlarge(roi, float(pixels))
+                
+                slice_ip.setValue(label_val)
+                slice_ip.fill(draw_roi)
+                
+            return slice_ip
+
+        # Execute in parallel
+        processors = ParallelUtils.parallel_for(create_slice_processor, n_slices)
+        
+        # Assemble stack
+        stack = ImageStack(width, height)
+        for p in processors:
+            stack.addSlice(p)
+            
+        label_map = ImagePlus("LabelMap", stack)
+        label_map.setCalibration(imp.getCalibration())
         return label_map
 
     def match_roi(self, anchor_entries, partner_entries, partner_label_map, anchor_label, partner_label, cal):
-        """Perform correlation analysis (MatchROI) and return formatted text lines."""
-        lines = []
-        pixel_area = self._pixel_area(cal)
+        """
+        Perform correlation analysis (MatchROI) to find the nearest partner puncta.
         
-        # Iterate Anchor ROIs
-        for m, anchor_entry in enumerate(anchor_entries):
-            anchor_roi = anchor_entry['roi']
-            anchor_metrics = anchor_entry['metrics']
+        This method implements the "Correlation Analysis" described in the SynapseJ paper.
+        For every punctum in the 'anchor' channel (e.g., Pre-synaptic), it searches for
+        overlapping puncta in the 'partner' channel (e.g., Post-synaptic).
+        
+        It calculates:
+        1. The number of overlapping partner puncta (VPerROI).
+        2. The total integrated density of overlapping partner puncta (VIDPerROI).
+        3. The distance to the nearest partner puncta (Euclidean distance).
+        
+        Args:
+            anchor_entries (list): List of puncta in the reference channel.
+            partner_entries (list): List of puncta in the target channel.
+            partner_label_map (ImagePlus): An image where pixel values correspond to partner puncta IDs.
+            anchor_label (str): Label for the anchor channel.
+            partner_label (str): Label for the partner channel.
+            cal (Calibration): Image calibration for distance measurements.
             
-            if partner_label_map.getStackSize() > 1:
-                partner_label_map.setSlice(anchor_roi.getPosition())
-            
-            partner_label_map.setRoi(anchor_roi)
-            stats = partner_label_map.getStatistics()
-            
-            if stats.max == 0:
-                continue
-                
-            hist = partner_label_map.getProcessor().getHistogram()
-            
-            lineP = ""
-            distSm = 0
-            VStar = -1
-            VPerROI = 0
-            VIDPerROI = 0
-            
-            for n in range(1, len(hist)):
-                count = hist[n]
-                if count > 0:
-                    if n-1 < len(partner_entries):
-                        partner_entry = partner_entries[n-1]
-                        partner_metrics = partner_entry['metrics']
-                        
-                        dx = anchor_metrics['X'] - partner_metrics['X']
-                        dy = anchor_metrics['Y'] - partner_metrics['Y']
-                        dist = math.sqrt(dx*dx + dy*dy)
-                        
-                        dx_m = anchor_metrics['XM'] - partner_metrics['XM']
-                        dy_m = anchor_metrics['YM'] - partner_metrics['YM']
-                        dist_m = math.sqrt(dx_m*dx_m + dy_m*dy_m)
-                        
-                        # Format match string: TAB + ID + TAB + Count + TAB + Dist + TAB + DistM
-                        match_str = "\t{}\t{}\t{:.3f}\t{:.3f}".format(n, count, dist, dist_m)
-                        
-                        if dist < distSm or distSm == 0:
-                            lineP = match_str + lineP
-                            distSm = dist
-                            VStar = n
-                        else:
-                            lineP = lineP + match_str
-                        
-                        VPerROI += 1
-                        VIDPerROI += partner_metrics['IntDen']
+        Returns:
+            list: A list of tab-separated strings, each representing a row in the correlation report.
+        """
+        if not anchor_entries:
+            return []
 
-            if VStar != -1:
-                # Construct final line: AnchorLabel + PartnerLabel + VPerROI + VIDPerROI + lineP
-                # Note: PartnerLabel comes from VResult[VStar] in macro.
-                # VResult is the array of result strings for the partner channel.
-                # Here we just use the partner label.
-                
-                partner_label_str = partner_entries[VStar-1]['metrics']['Label']
-                
-                # Macro: lineP = ROIResult[m]+VResult[VStar]+VPerROI+"\t"+VIDPerROI+lineP + "\n";
-                # ROIResult[m] is the full result line for anchor? Or just label?
-                # "CopyResultsTableArr" returns the full line.
-                # So we should output the full line for anchor and partner?
-                # The user's diff said "Label first, then best_partner_label".
-                # I'll output AnchorLabel + TAB + PartnerLabel + TAB + VPerROI + TAB + VIDPerROI + lineP
-                
-                final_line = "{}\t{}\t{}\t{}{}".format(anchor_metrics['Label'], partner_label_str, VPerROI, VIDPerROI, lineP)
-                lines.append(final_line)
+        # Group anchor entries by slice for parallel processing
+        anchors_by_slice = defaultdict(list)
+        for i, entry in enumerate(anchor_entries):
+            p = entry['roi'].getPosition()
+            if p < 1: p = 1
+            anchors_by_slice[p].append((i, entry))
             
-        partner_label_map.deleteRoi()
-        return lines
+        stack = partner_label_map.getStack()
+        
+        def process_slice(slice_idx):
+            # Get processor for this slice of the label map
+            ip = stack.getProcessor(slice_idx)
+            
+            slice_results = []
+            
+            for idx, anchor_entry in anchors_by_slice[slice_idx]:
+                anchor_roi = anchor_entry['roi']
+                anchor_metrics = anchor_entry['metrics']
+                
+                # Set ROI on processor to inspect the underlying partner labels.
+                ip.setRoi(anchor_roi)
+                
+                # Quick check for overlap: if max pixel value is 0, there are no partners here.
+                stats = ImageStatistics.getStatistics(ip, Measurements.MIN_MAX, cal)
+                
+                if stats.max == 0:
+                    continue
+                    
+                # Get histogram to identify partner IDs.
+                # The histogram bins correspond to pixel values (which are partner IDs).
+                # hist[k] tells us how many pixels of partner ID 'k' overlap with the anchor ROI.
+                hist = ip.getHistogram()
+                
+                lineP = ""
+                distSm = 0
+                VStar = -1
+                VPerROI = 0
+                VIDPerROI = 0
+                
+                # Iterate through histogram bins (skipping 0 which is background).
+                for n in range(1, len(hist)):
+                    count = hist[n]
+                    if count > 0:
+                        # Found an overlapping partner with ID 'n'.
+                        # Retrieve its metrics (ID is 1-based, list is 0-based).
+                        if n-1 < len(partner_entries):
+                            partner_entry = partner_entries[n-1]
+                            partner_metrics = partner_entry['metrics']
+                            
+                            # Calculate Euclidean distance between centroids.
+                            dx = anchor_metrics['X'] - partner_metrics['X']
+                            dy = anchor_metrics['Y'] - partner_metrics['Y']
+                            dist = math.sqrt(dx*dx + dy*dy)
+                            
+                            # Calculate distance between Centers of Mass (intensity-weighted).
+                            dx_m = anchor_metrics['XM'] - partner_metrics['XM']
+                            dy_m = anchor_metrics['YM'] - partner_metrics['YM']
+                            dist_m = math.sqrt(dx_m*dx_m + dy_m*dy_m)
+                            
+                            # Format the match details string.
+                            match_str = "\t{}\t{}\t{:.3f}\t{:.3f}".format(n, count, dist, dist_m)
+                            
+                            # Track the nearest neighbor (smallest distance).
+                            if dist < distSm or distSm == 0:
+                                lineP = match_str + lineP # Prepend nearest
+                                distSm = dist
+                                VStar = n
+                            else:
+                                lineP = lineP + match_str # Append others
+                            
+                            # Accumulate total overlap stats.
+                            VPerROI += 1
+                            VIDPerROI += partner_metrics['IntDen']
+
+                # If we found at least one partner (VStar != -1), record the result.
+                if VStar != -1:
+                    partner_label_str = partner_entries[VStar-1]['metrics']['Label']
+                    # Format: AnchorLabel, NearestPartnerLabel, Count, TotalIntDen, [Details...]
+                    final_line = "{}\t{}\t{}\t{}{}".format(anchor_metrics['Label'], partner_label_str, VPerROI, VIDPerROI, lineP)
+                    slice_results.append((idx, final_line))
+            
+            ip.resetRoi()
+            return slice_results
+
+        slices = list(anchors_by_slice.keys())
+        def task(i):
+            return process_slice(slices[i])
+            
+        nested_results = ParallelUtils.parallel_for(task, len(slices))
+        
+        all_results = []
+        for res in nested_results:
+            all_results.extend(res)
+            
+        all_results.sort(key=lambda x: x[0])
+        return [x[1] for x in all_results]
 
     def _filter_by_intensity(self, entries, marker_imp, thresholds, label,
                               result_imp, mask_imp, base_name, excel_suffix):
-        """Filter ROIs based on Min/Max intensity in the marker channel.
-
-        This reproduces the CoLocROI macro behavior:
-        for each ROI, measure Max and Min on the blurred marker image and
-        reject it if (max <= Hi || min <= Lo). The size parameter is logged in
-        IFALog but *not* used for gating.
         """
-        lo_val = thresholds['min']   # corresponds to ThrLo / ForLo (Min Int > Lo)
-        hi_val = thresholds['max']   # corresponds to ThrHi / ForHi (Max Int > Hi)
-        size_val = thresholds['size']
+        Filter ROIs based on Min/Max intensity in the marker channel.
 
-        kept = []
-        marker_rows = []
-        slice_kept_counts = defaultdict(int)
-        slice_total_counts = defaultdict(int)
+        This method implements the "CoLocROI" function from the SynapseJ macro.
+        It serves as a biological gate: puncta are only retained if they colocalize
+        with a structural marker (e.g., MAP2 for dendrites, GFAP for astrocytes).
+        
+        The logic is:
+        1. For each detected punctum (ROI), measure the intensity in the Marker Channel.
+        2. Check two conditions:
+           - Max Intensity > High Threshold (ThrHi/ForHi)
+           - Min Intensity > Low Threshold (ThrLo/ForLo)
+        3. If EITHER condition fails (Max <= Hi OR Min <= Lo), the punctum is rejected.
+           (Note: The macro logic is `if (max<=Hi || min<=Lo) { delete }`, which implies AND logic for retention).
+        
+        Args:
+            entries (list): List of candidate puncta.
+            marker_imp (ImagePlus): The marker channel image (usually blurred).
+            thresholds (dict): Dictionary containing 'min' and 'max' intensity thresholds.
+            label (str): Channel label for logging.
+            result_imp (ImagePlus): The result image to clear rejected puncta from.
+            mask_imp (ImagePlus): The mask image to clear rejected puncta from.
+            base_name (str): Base filename.
+            excel_suffix (str): Suffix for the output Excel file (unused in this port but kept for API compatibility).
+            
+        Returns:
+            list: The subset of entries that passed the intensity filter.
+        """
+        # Extract threshold values from the dictionary for easier access.
+        lo_val = thresholds['min']   # Corresponds to ThrLo / ForLo (Minimum Intensity Threshold).
+        hi_val = thresholds['max']   # Corresponds to ThrHi / ForHi (Maximum Intensity Threshold).
+        size_val = thresholds['size'] # Note: Size parameter is logged but not used for gating in the original macro logic here.
 
-        for idx, entry in enumerate(entries):
-            roi = entry['roi']
-            slice_idx = roi.getPosition()
-            slice_total_counts[slice_idx] += 1
+        # Group entries by slice for parallel processing
+        entries_by_slice = defaultdict(list)
+        for i, entry in enumerate(entries):
+            p = entry['roi'].getPosition()
+            if p < 1: p = 1
+            entries_by_slice[p].append((i, entry))
+            
+        marker_stack = marker_imp.getStack()
+        cal = marker_imp.getCalibration()
+        
+        # Phase 1: Parallel Check
+        # We iterate through all ROIs and check their intensity in the marker channel.
+        slices = list(entries_by_slice.keys())
+        
+        def check_slice(slice_idx):
+            try:
+                ip = marker_stack.getProcessor(slice_idx)
+                
+                slice_kept = []
+                slice_rejected = []
+                slice_marker_rows = []
+                
+                for idx, entry in entries_by_slice[slice_idx]:
+                    roi = entry['roi']
+                    try:
+                        ip.setRoi(roi)
+                        stats = ImageStatistics.getStatistics(ip, MEASUREMENT_FLAGS, cal)
+                        max_i = stats.max
+                        min_i = stats.min
+                        
+                        # The Gating Logic:
+                        # Reject if Max Intensity is too low OR Min Intensity is too low.
+                        # This ensures the punctum is "bright enough" and "consistently bright" in the marker channel.
+                        if max_i <= hi_val or min_i <= lo_val:
+                            slice_rejected.append(roi)
+                        else:
+                            slice_kept.append((idx, entry))
+                            # If kept, record the marker channel metrics for this punctum.
+                            # This allows analysis of the marker signal itself within the synaptic region.
+                            metrics = self._metrics_dict(
+                                base_name,
+                                label,
+                                entry['metrics'].get('Index', idx),
+                                stats,
+                                cal,
+                                roi,
+                            )
+                            slice_marker_rows.append((idx, metrics))
+                    except:
+                        self.log("WARNING: Skipping malformed ROI in _filter_by_intensity")
+                        slice_rejected.append(roi)
+                return (slice_kept, slice_rejected, slice_marker_rows)
+            except:
+                self.log("WARNING: Failed to process slice {} in _filter_by_intensity".format(slice_idx))
+                return ([], [], [])
 
-            if marker_imp.getStackSize() > 1 and slice_idx > 0:
-                marker_imp.setSlice(slice_idx)
-            marker_imp.setRoi(roi)
-            stats = marker_imp.getStatistics(MEASUREMENT_FLAGS)
-            max_i = stats.max
-            min_i = stats.min
+        def check_task(i):
+            return check_slice(slices[i])
 
-            # Macro: if (max <= Hi || min <= Lo) → reject
-            if max_i <= hi_val or min_i <= lo_val:
-                self._clear_roi(result_imp, mask_imp, roi)
-                continue
+        nested_results = ParallelUtils.parallel_for(check_task, len(slices))
+        
+        all_kept = []
+        all_rejected = []
+        all_marker_rows = []
+        
+        for kept, rejected, rows in nested_results:
+            all_kept.extend(kept)
+            all_rejected.extend(rejected)
+            all_marker_rows.extend(rows)
+            
+        # Sort kept entries to preserve order
+        all_kept.sort(key=lambda x: x[0])
+        kept_entries = [x[1] for x in all_kept]
+        
+        all_marker_rows.sort(key=lambda x: x[0])
+        marker_rows = [x[1] for x in all_marker_rows]
+        
+        # Phase 2: Parallel Clear
+        # We must remove the rejected puncta from the result images so they don't appear in the final output.
+        # This effectively "erases" them from the analysis.
+        
+        # Group rejected ROIs by slice
+        rejected_by_slice = defaultdict(list)
+        for roi in all_rejected:
+            p = roi.getPosition()
+            if p < 1: p = 1
+            rejected_by_slice[p].append(roi)
+            
+        result_stack = result_imp.getStack()
+        mask_stack = mask_imp.getStack() if mask_imp else None
+        
+        def clear_slice(slice_idx):
+            # Clear from result_imp (the processed image used for visualization/measurement)
+            res_ip = result_stack.getProcessor(slice_idx)
+            mask_ip = mask_stack.getProcessor(slice_idx) if mask_stack else None
+            
+            for roi in rejected_by_slice[slice_idx]:
+                # Set pixels to 0 (black)
+                res_ip.setValue(0)
+                res_ip.fill(roi)
+                if mask_ip:
+                    mask_ip.setValue(0)
+                    mask_ip.fill(roi)
+                    
+        clear_slices = list(rejected_by_slice.keys())
+        def clear_task(i):
+            clear_slice(clear_slices[i])
+            
+        if clear_slices:
+            ParallelUtils.parallel_for(clear_task, len(clear_slices))
 
-            kept.append(entry)
-            slice_kept_counts[slice_idx] += 1
-
-            # Also measure marker-channel stats for this ROI into a per-image
-            # table (PreThrResults.txt / PstRResults.txt in the Excel folder).
-            metrics = self._metrics_dict(
-                base_name,
-                label,
-                entry['metrics'].get('Index', idx),
-                stats,
-                marker_imp.getCalibration(),
-                roi,
-            )
-            marker_rows.append(metrics)
-
-        marker_imp.deleteRoi()
-
+        # Log the results of the gating process.
         self.log("{} gating (intensity only): {}/{} retained (Max>{}, Min>{}, size param={})".format(
-            label, len(kept), len(entries), hi_val, lo_val, size_val))
-        # for s in sorted(slice_total_counts.keys()):
-            # self.log("DEBUG: {} gating Slice {}: Kept {}/{}".format(label, s, slice_kept_counts[s], slice_total_counts[s]))
-
+            label, len(kept_entries), len(entries), hi_val, lo_val, size_val))
+        
+        # If any puncta were retained, save their marker channel measurements to disk.
         if marker_rows:
             out_path = os.path.join(self.excel_dir, base_name + excel_suffix)
             self.save_results_table(marker_rows, out_path)
 
-        return kept
+        return kept_entries
 
     def _create_synapse_image(self, source_imp, rois, title):
-        """Create a new image containing only the pixels within the provided ROIs."""
+        """
+        Create a new image containing ONLY the pixels within the provided ROIs.
+        
+        This utility function is used to generate the "Synapse Only" images for visualization.
+        It takes an original image and a list of ROIs (e.g., confirmed synapses), and produces
+        a new image where everything outside these ROIs is black (0).
+        
+        Args:
+            source_imp (ImagePlus): The source image containing the pixel data.
+            rois (list): The list of ROIs to preserve.
+            title (str): The title for the new image.
+            
+        Returns:
+            ImagePlus: A new image containing only the ROI contents.
+        """
         width = source_imp.getWidth()
         height = source_imp.getHeight()
         stack_size = source_imp.getStackSize()
         src_stack = source_imp.getStack()
         
-        # Create new stack of same dimensions
-        new_stack = ImageStack(width, height)
-        for i in range(1, stack_size + 1):
-            ip = src_stack.getProcessor(i)
-            # Create empty processor of same type (Byte, Short, Float)
-            new_ip = ip.createProcessor(width, height) 
-            # Ensure it's black/zeroed
-            new_ip.setValue(0)
-            new_ip.fill()
-            new_stack.addSlice(str(i), new_ip)
+        # Group ROIs by slice for parallel processing
+        rois_by_slice = defaultdict(list)
+        for roi in rois:
+            p = roi.getPosition()
+            if p < 1: p = 1
+            rois_by_slice[p].append(roi)
             
-        if rois:
-            for roi in rois:
-                slice_idx = roi.getPosition()
-                if slice_idx < 1: slice_idx = 1
-                if slice_idx > stack_size: continue
+        def create_slice(i):
+            try:
+                slice_idx = i + 1
+                # Create a blank processor (black background)
+                # We use the same bit depth as the source image
+                # But for simplicity and matching macro, we often use 8-bit or copy source type.
+                # The macro uses "Duplicate" then "Clear Outside".
+                # Here we create a new processor and copy pixels inside ROIs.
                 
+                # Get source processor
                 src_ip = src_stack.getProcessor(slice_idx)
-                dst_ip = new_stack.getProcessor(slice_idx)
                 
-                # Extract ROI content
-                src_ip.setRoi(roi)
-                cropped = src_ip.crop()
+                # Create new processor of same type
+                new_ip = src_ip.createProcessor(width, height)
+                new_ip.setValue(0)
+                new_ip.fill()
                 
-                # Paste into destination using COPY_TRANSPARENT to avoid overwriting with bounding box background
-                bounds = roi.getBounds()
-                dst_ip.copyBits(cropped, bounds.x, bounds.y, Blitter.COPY_TRANSPARENT)
+                # For each ROI in this slice, copy pixels from source to new
+                current_rois = rois_by_slice[slice_idx]
+                
+                # Optimization: If we have ROIs, we can use them to copy.
+                for roi in current_rois:
+                    src_ip.setRoi(roi)
+                    new_ip.setRoi(roi)
+                    
+                    # Copy pixels from source ROI to destination ROI
+                    # blitter is one way, or just copy/paste
+                    # simpler: get the ROI processor from source and insert it into destination
+                    roi_ip = src_ip.crop()
+                    new_ip.insert(roi_ip, roi.getBounds().x, roi.getBounds().y)
+                    
+                return new_ip
+            except Exception as e:
+                self.log("ERROR in _create_synapse_image create_slice {}: {}".format(i, e))
+                return src_stack.getProcessor(i+1).createProcessor(width, height)
+
+        # Execute in parallel
+        processors = ParallelUtils.parallel_for(create_slice, stack_size)
+        
+        # Assemble stack
+        new_stack = ImageStack(width, height)
+        for p in processors:
+            new_stack.addSlice(p)
             
         new_imp = ImagePlus(title, new_stack)
         new_imp.setCalibration(source_imp.getCalibration())
+        
         return new_imp
 
+    def save_synapse_figures(self, base_name, pre_result_imp, post_result_imp, syn_pre_rois, syn_post_rois, c1_imp, c2_imp):
+        """
+        Generate paper-style figures showing only colocalized synaptic puncta.
+        
+        This creates a visual verification of the analysis:
+        1. Creates images containing ONLY the synaptic puncta (filtering out isolated ones).
+        2. Merges these into a multi-channel composite.
+        
+        The color scheme follows the paper's convention:
+        - Red: Post-synaptic puncta (Synaptic only)
+        - Green: Pre-synaptic puncta (Synaptic only)
+        - Blue: Original Post-synaptic Marker (C1)
+        - Gray: Original Pre-synaptic Marker (C2)
+        
+        Args:
+            base_name (str): Image name.
+            pre_result_imp (ImagePlus): Processed pre-synaptic image.
+            post_result_imp (ImagePlus): Processed post-synaptic image.
+            syn_pre_rois (list): List of pre-synaptic ROIs that are part of a synapse.
+            syn_post_rois (list): List of post-synaptic ROIs that are part of a synapse.
+            c1_imp (ImagePlus): Original Channel 1 (Post Marker).
+            c2_imp (ImagePlus): Original Channel 2 (Pre Marker).
+        """
+        # Create images containing ONLY the synaptic ROIs
+        pre_syn_imp = self._create_synapse_image(pre_result_imp, syn_pre_rois, base_name + "PreSyn")
+        post_syn_imp = self._create_synapse_image(post_result_imp, syn_post_rois, base_name + "PostSyn")
+        
+        # Save individual channels for debugging/verification
+        IJ.save(pre_syn_imp, os.path.join(self.dest_dir, base_name + "PreSyn.tif"))
+        IJ.save(post_syn_imp, os.path.join(self.dest_dir, base_name + "PostSyn.tif"))
+        
+        # Create Merge: 
+        # Channel 1 (Red): Post-synaptic Synaptic Puncta
+        # Channel 2 (Green): Pre-synaptic Synaptic Puncta
+        # Channel 3 (Blue): Raw Post-Marker Channel (Context)
+        # Channel 4 (Gray): Raw Pre-Marker Channel (Context)
+        c1 = post_syn_imp # Red
+        c2 = pre_syn_imp  # Green
+        c3 = c1_imp.duplicate() # Blue
+        c4 = c2_imp.duplicate() # Gray
+        
+        merged = RGBStackMerge.mergeChannels([c1, c2, c3, c4], True)
+        
+        if merged is not None:
+            out_path = os.path.join(self.dest_dir, base_name + "SynapseMerge.tif")
+            IJ.save(merged, out_path)
+            merged.close()
+        
+        pre_syn_imp.close()
+        post_syn_imp.close()
+        c3.close()
+        c4.close()
+
     def generate_presentation_outputs(self, base_name, pre_entries, post_entries, syn_pre_rois, syn_post_rois, cal, pre_result_imp, post_result_imp, c1_imp, c2_imp):
-        """Generate user-friendly presentation outputs in a 'present' subfolder."""
+        """
+        Generate user-friendly presentation outputs in a 'present' subfolder.
+        
+        These outputs are designed for easy visualization and reporting in presentations or papers.
+        They include:
+        1. A comprehensive CSV report with overlap statistics.
+        2. An "Overlap Mask" image showing the exact pixels where pre- and post-synaptic puncta intersect.
+        3. An "Annotated Map" showing all detected puncta, color-coded by type (Synaptic vs Isolated).
+        
+        Args:
+            base_name (str): Image name.
+            pre_entries (list): All detected pre-synaptic puncta.
+            post_entries (list): All detected post-synaptic puncta.
+            syn_pre_rois (list): Confirmed synaptic pre-synaptic ROIs.
+            syn_post_rois (list): Confirmed synaptic post-synaptic ROIs.
+            cal (Calibration): Image calibration.
+            pre_result_imp (ImagePlus): Processed pre-synaptic image.
+            post_result_imp (ImagePlus): Processed post-synaptic image.
+            c1_imp (ImagePlus): Original Post-Marker channel.
+            c2_imp (ImagePlus): Original Pre-Marker channel.
+        """
         present_dir = os.path.join(self.dest_dir, 'present')
         if not os.path.exists(present_dir):
             os.makedirs(present_dir)
 
         # --- 1. Data Table ---
+        # Create sets for O(1) lookup of synaptic status.
         syn_pre_set = set(syn_pre_rois)
         syn_post_set = set(syn_post_rois)
         
-        # Helper to calculate overlap
+        # Helper to calculate overlap statistics for a given ROI against a target image.
         def get_overlap_stats(roi, target_imp, threshold=0):
             if target_imp.getStackSize() > 1:
                 target_imp.setSlice(roi.getPosition())
@@ -1587,7 +2869,7 @@ class SynapseJ4ChannelComplete(object):
 
         report_rows = []
         
-        # Process Pre
+        # Process Pre-synaptic Puncta
         for entry in pre_entries:
             roi = entry['roi']
             metrics = entry['metrics']
@@ -1633,7 +2915,7 @@ class SynapseJ4ChannelComplete(object):
             ])
             report_rows.append(row)
             
-        # Process Post
+        # Process Post-synaptic Puncta
         for entry in post_entries:
             roi = entry['roi']
             metrics = entry['metrics']
@@ -1683,6 +2965,8 @@ class SynapseJ4ChannelComplete(object):
         self.save_results_table(report_rows, table_path)
         
         # --- 2. Overlap Image (Intersection Mask) ---
+        # This image shows ONLY the pixels that are common to both pre- and post-synaptic puncta.
+        # It is useful for visualizing the "synaptic interface".
         width = pre_result_imp.getWidth()
         height = pre_result_imp.getHeight()
         stack_size = pre_result_imp.getStackSize()
@@ -1690,21 +2974,22 @@ class SynapseJ4ChannelComplete(object):
         overlap_stack = ImageStack(width, height)
         
         for i in range(1, stack_size + 1):
-            # Create Pre Mask
+            # Create Pre Mask (Binary)
             pre_ip = ByteProcessor(width, height)
             for roi in syn_pre_rois:
                 if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
                     pre_ip.setValue(255)
                     pre_ip.fill(roi)
             
-            # Create Post Mask
+            # Create Post Mask (Binary)
             post_ip = ByteProcessor(width, height)
             for roi in syn_post_rois:
                 if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
                     post_ip.setValue(255)
                     post_ip.fill(roi)
             
-            # Intersect
+            # Intersect (AND operation)
+            # Result is 255 where both are 255, 0 otherwise.
             pre_ip.copyBits(post_ip, 0, 0, Blitter.AND)
             overlap_stack.addSlice(str(i), pre_ip)
             
@@ -1714,6 +2999,14 @@ class SynapseJ4ChannelComplete(object):
         overlap_imp.close()
         
         # --- 3. Annotated Map (Schematic) ---
+        # This generates an RGB image where puncta are drawn as colored outlines/fills.
+        # It provides a clear "map" of the detected structures without the noise of the original image.
+        # Color Code:
+        # - Dark Green: Isolated Pre-synaptic
+        # - Dark Red: Isolated Post-synaptic
+        # - Bright Green: Synaptic Pre-synaptic
+        # - Bright Red: Synaptic Post-synaptic
+        
         # Create RGB Stack
         map_stack = ImageStack(width, height)
         font = Font("SansSerif", Font.PLAIN, 10)
@@ -1767,97 +3060,141 @@ class SynapseJ4ChannelComplete(object):
         IJ.save(map_imp, os.path.join(present_dir, "{}_Annotated_Map.tif".format(base_name)))
         map_imp.close()
 
-    def save_synapse_figures(self, base_name, pre_result_imp, post_result_imp, syn_pre_rois, syn_post_rois, c1_imp, c2_imp):
-        """Generate paper-style figures showing only colocalized synaptic puncta."""
-        pre_syn_imp = self._create_synapse_image(pre_result_imp, syn_pre_rois, base_name + "PreSyn")
-        post_syn_imp = self._create_synapse_image(post_result_imp, syn_post_rois, base_name + "PostSyn")
-        
-        # Save individual channels for debugging
-        IJ.save(pre_syn_imp, os.path.join(self.dest_dir, base_name + "PreSyn.tif"))
-        IJ.save(post_syn_imp, os.path.join(self.dest_dir, base_name + "PostSyn.tif"))
-        
-        # Create Merge: Red=Post, Green=Pre (matching paper convention)
-        # Also include original marker channels: Blue=C1 (Post Marker), Gray=C2 (Pre Marker)
-        c1 = post_syn_imp # Red
-        c2 = pre_syn_imp  # Green
-        c3 = c1_imp.duplicate() # Blue
-        c4 = c2_imp.duplicate() # Gray
-        
-        merged = RGBStackMerge.mergeChannels([c1, c2, c3, c4], True)
-        
-        if merged is not None:
-            out_path = os.path.join(self.dest_dir, base_name + "SynapseMerge.tif")
-            IJ.save(merged, out_path)
-            merged.close()
-        
-        pre_syn_imp.close()
-        post_syn_imp.close()
-        c3.close()
-        c4.close()
-
-
 from java.util.concurrent import Executors, Callable, Future, TimeUnit
 from java.util import ArrayList
 
 class ParallelUtils(object):
+    """
+    Utility class for parallel execution using Java's ExecutorService.
+    
+    Since this script runs within the Jython environment of Fiji, it has access to 
+    Java's robust concurrency libraries. This allows for multi-threaded processing 
+    of images, significantly speeding up the analysis of large datasets.
+    """
     _executor = None
 
     @classmethod
     def get_executor(cls):
+        """
+        Singleton accessor for the thread pool.
+        Creates a FixedThreadPool with 8 threads if one does not exist.
+        Adjust the thread count based on the available CPU cores.
+        """
         if cls._executor is None:
-            cls._executor = Executors.newFixedThreadPool(8) # Adjust based on CPU
+            # Create a thread pool with a fixed number of threads (8).
+            # This limits the number of concurrent tasks to avoid overwhelming the system.
+            # In a production environment, this could be set dynamically based on Runtime.getRuntime().availableProcessors().
+            cls._executor = Executors.newFixedThreadPool(8) 
         return cls._executor
 
     @classmethod
     def run_tasks(cls, tasks):
-        """Run a list of no-arg functions (callables) in parallel."""
+        """
+        Run a list of no-arg functions (callables) in parallel.
+        
+        Args:
+            tasks: A list of Python functions (no arguments) to execute.
+            
+        Returns:
+            A list of return values from the executed functions, in the same order.
+        """
         executor = cls.get_executor()
         
-        # Wrap python functions in Java Callable
+        # Wrap python functions in Java Callable interface.
+        # This bridges the gap between Python functions and Java's threading model.
+        # Java's ExecutorService expects objects implementing the Callable interface.
         class PyCallable(Callable):
             def __init__(self, func):
                 self.func = func
             def call(self):
+                # Execute the Python function when called by the Java thread.
                 return self.func()
         
+        # Create a Java ArrayList to hold the tasks.
         java_tasks = ArrayList()
         for t in tasks:
+            # Wrap each Python function and add it to the list.
             java_tasks.add(PyCallable(t))
             
+        # invokeAll submits all tasks to the thread pool and blocks until ALL of them are complete.
+        # This ensures that we don't proceed until all parallel work is finished.
         futures = executor.invokeAll(java_tasks)
+        
         results = []
+        # Iterate through the Future objects returned by invokeAll.
         for f in futures:
+            # f.get() retrieves the result of the computation.
+            # Since invokeAll blocks until completion, get() will return immediately with the result
+            # or throw an exception if the task failed.
             results.append(f.get())
         return results
 
     @classmethod
     def parallel_for(cls, func, n_items):
-        """Run func(i) for i in range(n_items) in parallel."""
+        """
+        Run func(i) for i in range(n_items) in parallel.
+        
+        A parallel equivalent of a simple for loop.
+        Useful for processing a list of items where each iteration is independent.
+        """
         tasks = []
         for i in range(n_items):
+            # Create a lambda that calls the function with the current index 'i'.
+            # We use 'idx=i' as a default argument to capture the value of 'i' at this iteration.
+            # Without this, the lambda would capture the variable 'i' itself, which would be the last value of the loop.
             tasks.append(lambda idx=i: func(idx))
+        
+        # Execute the list of tasks in parallel.
         return cls.run_tasks(tasks)
 
     @classmethod
     def shutdown(cls):
+        """Gracefully shut down the thread pool."""
         if cls._executor is not None:
+            # Initiate an orderly shutdown in which previously submitted tasks are executed,
+            # but no new tasks will be accepted.
             cls._executor.shutdown()
 
 
-if __name__ == '__main__':
+def main():
+    # --- Main Execution Entry Point ---
+    # This block is executed only when the script is run directly (not imported as a module).
+    
+    # 1. Determine Configuration Path
+    #    The script requires a configuration file to know where the images are and what parameters to use.
+    #    We check command line arguments first, then environment variables.
     config_path = None
     if len(sys.argv) > 1:
+        # If an argument is provided, assume it is the path to the config file.
         config_path = sys.argv[1]
     elif 'SYNAPSEJ_CONFIG' in os.environ:
+        # Fallback to environment variable if no argument is provided.
         config_path = os.environ['SYNAPSEJ_CONFIG']
 
+    # If no configuration is found, print usage instructions and exit.
     if not config_path:
         print('Usage: SYNAPSEJ_CONFIG=path/to/config fiji --headless --run Pynapse.py')
+        # Exit with error code 1.
         System.exit(1)
 
     try:
+        # 2. Initialize Analyzer
+        #    Create an instance of the main class. This parses the config file,
+        #    validates parameters, and sets up the output directory structure.
         analyzer = SynapseJ4ChannelComplete(config_path)
+        
+        # 3. Run Analysis
+        #    Start the batch processing loop. This iterates through all images 
+        #    in the input directory defined in the config and processes them one by one.
         analyzer.process_directory()
     finally:
+        # 4. Cleanup
+        #    Ensure the thread pool is shut down properly.
+        #    If we don't do this, the JVM might keep running because of the active threads in the pool.
         ParallelUtils.shutdown()
+        
+        # Force exit with success code 0.
         System.exit(0)
+
+if __name__ == '__main__':
+    main()
