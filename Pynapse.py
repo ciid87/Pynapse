@@ -194,7 +194,7 @@ if is_jython():
 
     # MEASUREMENT_FLAGS: Defines the set of metrics to be calculated for each detected puncta.
     # These flags correspond to the "Set Measurements" command in ImageJ.
-    # - AREA: Size of the puncta in calibrated units (e.g., µm²).
+    # - AREA: Size of the puncta in calibrated units (e.g., um^2).
     # - MEAN: Mean gray value intensity.
     # - MIN_MAX: Minimum and maximum gray values.
     # - CENTROID/CENTER_OF_MASS: Spatial coordinates of the puncta.
@@ -248,8 +248,8 @@ def default_config():
         # --- Pre-synaptic Detection Parameters ---
         'pre_min': 658,           # Intensity threshold for pre-synaptic puncta. Pixels below this are ignored. Ref: SynapseJ_v_1.ijm line 35
         'pre_noise': 350,         # Noise tolerance for 'Find Maxima'. Determines peak sensitivity. Ref: SynapseJ_v_1.ijm line 36
-        'pre_size_low': 0.08,     # Minimum size (µm²) for a valid pre-synaptic puncta. Filters out noise. Ref: SynapseJ_v_1.ijm line 37
-        'pre_size_high': 2.5,     # Maximum size (µm²) for a valid pre-synaptic puncta. Filters out aggregates. Ref: SynapseJ_v_1.ijm line 38
+        'pre_size_low': 0.08,     # Minimum size (um^2) for a valid pre-synaptic puncta. Filters out noise. Ref: SynapseJ_v_1.ijm line 37
+        'pre_size_high': 2.5,     # Maximum size (um^2) for a valid pre-synaptic puncta. Filters out aggregates. Ref: SynapseJ_v_1.ijm line 38
         'pre_blur': True,         # Whether to apply median blurring to reduce noise before detection. Ref: SynapseJ_v_1.ijm line 39
         'pre_blur_radius': 2,     # Radius (pixels) for the median blur filter. Ref: SynapseJ_v_1.ijm line 40
         'pre_bkd': 0,             # Radius for Rolling Ball background subtraction (0 = disabled). Ref: SynapseJ_v_1.ijm line 41
@@ -260,8 +260,8 @@ def default_config():
         # --- Post-synaptic Detection Parameters ---
         'post_min': 578,          # Intensity threshold for post-synaptic puncta. Ref: SynapseJ_v_1.ijm line 44
         'post_noise': 350,        # Noise tolerance for post-synaptic 'Find Maxima'. Ref: SynapseJ_v_1.ijm line 45
-        'post_size_low': 0.08,    # Minimum size (µm²) for post-synaptic puncta. Ref: SynapseJ_v_1.ijm line 46
-        'post_size_high': 2.5,    # Maximum size (µm²) for post-synaptic puncta. Ref: SynapseJ_v_1.ijm line 47
+        'post_size_low': 0.08,    # Minimum size (um^2) for post-synaptic puncta. Ref: SynapseJ_v_1.ijm line 46
+        'post_size_high': 2.5,    # Maximum size (um^2) for post-synaptic puncta. Ref: SynapseJ_v_1.ijm line 47
         'post_blur': True,        # Apply median blur to post-synaptic channel. Ref: SynapseJ_v_1.ijm line 48
         'post_blur_radius': 2,    # Radius for post-synaptic median blur. Ref: SynapseJ_v_1.ijm line 49
         'post_bkd': 0,            # Background subtraction radius for post-synaptic channel. Ref: SynapseJ_v_1.ijm line 50
@@ -300,6 +300,24 @@ class SynapseJ4ChannelComplete(object):
     and any such cases are logged for transparency.
     """
 
+    # Standard columns expected by SynapseJ macro downstream analysis
+    STANDARD_COLUMNS = [
+        'Label', 'Area', 'Mean', 'Min', 'Max', 'X', 'Y', 'XM', 'YM', 
+        'Perim.', 'Feret', 'IntDen', 'RawIntDen', 'FeretX', 'FeretY', 
+        'FeretAngle', 'MinFeret'
+    ]
+
+    def _filter_standard_metrics(self, rows):
+        """Filter rows to include only standard SynapseJ columns."""
+        filtered_rows = []
+        for row in rows:
+            filtered = OrderedDict()
+            for col in self.STANDARD_COLUMNS:
+                if col in row:
+                    filtered[col] = row[col]
+            filtered_rows.append(filtered)
+        return filtered_rows
+
     def __init__(self, config_path=None):
         """
         Initialize the analyzer, load configuration, and prepare result accumulators.
@@ -332,6 +350,10 @@ class SynapseJ4ChannelComplete(object):
                          .replace('Post IntDen', 'Pre IntDen') \
                          .replace('Postsynaptic', 'Presynaptic')
         self.post_correlation_rows = [reverse_header.strip()]
+
+        # Batch report accumulator for new presentation format
+        # Stores all Synapses (Complete) from all images
+        self.batch_synapse_rows = []
 
         self.log_messages = []
 
@@ -926,11 +948,11 @@ class SynapseJ4ChannelComplete(object):
         # These contain every detected punctum (after marker gating) regardless of synaptic status.
         if pre_rows:
             self.all_pre_results.extend(pre_rows)
-            self.save_results_table(pre_rows, os.path.join(self.dest_dir, '{}Pre.txt'.format(name_short)))
+            self.save_results_table(self._filter_standard_metrics(pre_rows), os.path.join(self.dest_dir, '{}Pre.txt'.format(name_short)))
             self.save_roi_set([entry['roi'] for entry in pre_entries], os.path.join(self.dest_dir, '{}PreALLRoiSet.zip'.format(name_short)))
         if post_rows:
             self.all_post_results.extend(post_rows)
-            self.save_results_table(post_rows, os.path.join(self.dest_dir, '{}Post.txt'.format(name_short)))
+            self.save_results_table(self._filter_standard_metrics(post_rows), os.path.join(self.dest_dir, '{}Post.txt'.format(name_short)))
             self.save_roi_set([entry['roi'] for entry in post_entries], os.path.join(self.dest_dir, '{}PostALLRoiSet.zip'.format(name_short)))
 
         # --- Synapse Finding ---
@@ -953,14 +975,14 @@ class SynapseJ4ChannelComplete(object):
             syn_pre_rows = self.measure_rois(syn_pre_rois, pre_result_imp, name_short, 'Pre', cal)
             self.syn_pre_results.extend(syn_pre_rows)
             # Per-image synaptic pre-synaptic results (Excel folder) + per-macro aggregate
-            self.save_results_table(syn_pre_rows, os.path.join(self.excel_dir, '{}PreResults.txt'.format(name_short)))
+            self.save_results_table(self._filter_standard_metrics(syn_pre_rows), os.path.join(self.excel_dir, '{}PreResults.txt'.format(name_short)))
             self.save_roi_set(syn_pre_rois, os.path.join(self.dest_dir, '{}PreSYNRoiSet.zip'.format(name_short)))
 
         if syn_post_rois:
             syn_post_rows = self.measure_rois(syn_post_rois, post_result_imp, name_short, 'Post', cal)
             self.syn_post_results.extend(syn_post_rows)
             # Per-image synaptic post-synaptic results (Excel folder) + per-macro aggregate
-            self.save_results_table(syn_post_rows, os.path.join(self.excel_dir, '{}PostResults.txt'.format(name_short)))
+            self.save_results_table(self._filter_standard_metrics(syn_post_rows), os.path.join(self.excel_dir, '{}PostResults.txt'.format(name_short)))
             self.save_roi_set(syn_post_rois, os.path.join(self.dest_dir, '{}PostSYNRoiSet.zip'.format(name_short)))
 
         # Always save filtered images, even if no synapses were detected, to match macro behavior.
@@ -982,16 +1004,13 @@ class SynapseJ4ChannelComplete(object):
         if pre_label_map: pre_label_map.close()
         if post_label_map: post_label_map.close()
         
-        # Save Overlay (4 channels, no outlines)
+        # Save Overlay (4 channels, no outlines) - matches SynapseJ merge output
         c1_imp = channels[0] # C1
         c2_imp = channels[1] # C2
         self.save_overlay(pre_result_imp, post_result_imp, c1_imp, c2_imp, name_short)
 
-        # Save Paper-Style Synapse Figures (Colocalized puncta only)
-        self.save_synapse_figures(name_short, pre_result_imp, post_result_imp, syn_pre_rois, syn_post_rois, c1_imp, c2_imp)
-
-        # Generate Presentation Outputs
-        self.generate_presentation_outputs(name_short, pre_entries, post_entries, syn_pre_rois, syn_post_rois, cal, pre_result_imp, post_result_imp, c1_imp, c2_imp)
+        # Generate Presentation Outputs (Batch Synapse Report only)
+        self.generate_presentation_outputs(name_short, pre_entries, post_entries, syn_pre_rois, syn_post_rois, cal, pre_result_imp, post_result_imp)
 
         # Collated ResultsIF row (macro LABEL, Syn, SynPre, ThrPre, ForPost, Post, Pre).
         self.record_summary(
@@ -1018,8 +1037,8 @@ class SynapseJ4ChannelComplete(object):
             processed_imp (ImagePlus): The preprocessed image.
             noise_tolerance (float): Tolerance for finding local maxima.
             threshold_val (float): Minimum intensity threshold.
-            size_low_um (float): Minimum size in µm².
-            size_high_um (float): Maximum size in µm².
+            size_low_um (float): Minimum size in um^2.
+            size_high_um (float): Maximum size in um^2.
             cal (Calibration): Image calibration.
             
         Returns:
@@ -1181,7 +1200,7 @@ class SynapseJ4ChannelComplete(object):
         3. Detection:
            - If use_maxima is True: Uses 'Find Maxima' to segment dense puncta.
            - If use_maxima is False: Uses simple intensity thresholding.
-        4. Size Filtering: Removes particles outside the specified size range (µm²).
+        4. Size Filtering: Removes particles outside the specified size range (um^2).
         5. Mask Generation: Creates a binary mask of valid puncta.
         6. Result Generation: Subtracts the mask from the original image to isolate puncta.
         
@@ -1253,7 +1272,7 @@ class SynapseJ4ChannelComplete(object):
             ParallelUtils.parallel_for(bkd_slice, work_imp.getStackSize())
             
         mask_imp = None
-        # Convert size bounds from µm² to pixels for ParticleAnalyzer.
+        # Convert size bounds from um^2 to pixels for ParticleAnalyzer.
         # This is necessary because we often strip calibration during processing to avoid issues.
         min_pixels, max_pixels = self._size_bounds_in_pixels(params['size_low'], params['size_high'], cal)
         
@@ -1539,6 +1558,42 @@ class SynapseJ4ChannelComplete(object):
         def get_stat(obj, name, default=0):
             return getattr(obj, name, default)
 
+        # Robust Feret retrieval: Try ROI first (geometry based), then stats (pixel based)
+        feret_vals = None
+        try:
+            if roi:
+                feret_vals = roi.getFeretValues() # [Feret, Angle, MinFeret, FeretX, FeretY]
+        except:
+            pass
+
+        feret = feret_vals[0] if feret_vals else get_stat(stats, 'feret')
+        # Fallback for Feret if 0 (common in headless mode or for small PointRois)
+        if feret == 0 and stats.area > 0:
+            # Approximate as circle diameter: Area = pi * (d/2)^2  =>  d = 2 * sqrt(Area / pi)
+            feret = 2 * math.sqrt(stats.area / math.pi)
+
+        feret_angle = feret_vals[1] if feret_vals else get_stat(stats, 'feretAngle')
+        min_feret = feret_vals[2] if feret_vals else get_stat(stats, 'minFeret')
+        feret_x = feret_vals[3] if feret_vals else get_stat(stats, 'feretX')
+        feret_y = feret_vals[4] if feret_vals else get_stat(stats, 'feretY')
+
+        # New: Bounding box width/height (um), relative to Feret
+        bbox_width, bbox_height = 0.0, 0.0
+        if roi:
+            bounds = roi.getBounds()
+            px_w = self._pixel_width(cal)
+            px_h = self._pixel_height(cal)
+            bbox_width = bounds.width * px_w
+            bbox_height = bounds.height * px_h
+            
+            # Rotate for Feret-relative dimensions if angle is significant
+            # This approximates the "caliper" width/height relative to the max diameter
+            if feret_angle != 0:
+                # If the Feret angle is closer to vertical (>45 deg), swap width/height
+                # to represent dimensions along/perpendicular to the Feret axis roughly
+                if abs(feret_angle) > 45:
+                    bbox_width, bbox_height = bbox_height, bbox_width
+
         return {
             # Standard ImageJ Result Columns
             'Label': '{}:{}:{}'.format(base_name, label, index),
@@ -1551,13 +1606,15 @@ class SynapseJ4ChannelComplete(object):
             'XM': stats.xCenterOfMass,
             'YM': stats.yCenterOfMass,
             'Perim.': get_stat(stats, 'perimeter') or (roi.getLength() if roi else 0),
-            'Feret': get_stat(stats, 'feret'),
+            'Feret': feret,
             'IntDen': get_stat(stats, 'integratedDensity') or (stats.area * stats.mean), # Fallback if field missing
             'RawIntDen': get_stat(stats, 'rawIntegratedDensity') or (stats.pixelCount * stats.mean), # Fallback
-            'FeretX': get_stat(stats, 'feretX'),
-            'FeretY': get_stat(stats, 'feretY'),
-            'FeretAngle': get_stat(stats, 'feretAngle'),
-            'MinFeret': get_stat(stats, 'minFeret'),
+            'FeretX': feret_x,
+            'FeretY': feret_y,
+            'FeretAngle': feret_angle,
+            'MinFeret': min_feret,
+            'BBox Width (um)': bbox_width,
+            'BBox Height (um)': bbox_height,
             
             # Internal/Legacy keys (kept for downstream logic compatibility if needed)
             'Image': base_name,
@@ -1571,7 +1628,7 @@ class SynapseJ4ChannelComplete(object):
 
     def _size_bounds_in_pixels(self, min_um2, max_um2, cal):
         """
-        Translate µm² size bounds into pixel counts.
+        Translate um^2 size bounds into pixel counts.
         
         The ParticleAnalyzer requires size limits in pixels (or calibrated units if set, 
         but explicit pixel conversion is safer for headless operation).
@@ -1826,19 +1883,19 @@ class SynapseJ4ChannelComplete(object):
             
         # Save the detailed list of ALL detected pre-synaptic puncta (before synapse filtering).
         if self.all_pre_results:
-            self.save_results_table(self.all_pre_results, os.path.join(self.dest_dir, 'All Pre Results.txt'))
+            self.save_results_table(self._filter_standard_metrics(self.all_pre_results), os.path.join(self.dest_dir, 'All Pre Results.txt'))
             
         # Save the detailed list of ALL detected post-synaptic puncta (before synapse filtering).
         if self.all_post_results:
-            self.save_results_table(self.all_post_results, os.path.join(self.dest_dir, 'All Post Results.txt'))
+            self.save_results_table(self._filter_standard_metrics(self.all_post_results), os.path.join(self.dest_dir, 'All Post Results.txt'))
             
         # Save the list of CONFIRMED synaptic pre-puncta (those that colocalized).
         if self.syn_pre_results:
-            self.save_results_table(self.syn_pre_results, os.path.join(self.dest_dir, 'Syn Pre Results.txt'))
+            self.save_results_table(self._filter_standard_metrics(self.syn_pre_results), os.path.join(self.dest_dir, 'Syn Pre Results.txt'))
             
         # Save the list of CONFIRMED synaptic post-puncta (those that colocalized).
         if self.syn_post_results:
-            self.save_results_table(self.syn_post_results, os.path.join(self.dest_dir, 'Syn Post Results.txt'))
+            self.save_results_table(self._filter_standard_metrics(self.syn_post_results), os.path.join(self.dest_dir, 'Syn Post Results.txt'))
             
         # Save the paired synapse data (currently unused/empty in this implementation but kept for compatibility).
         if self.synapse_pair_rows:
@@ -1851,6 +1908,20 @@ class SynapseJ4ChannelComplete(object):
         # Save the Post->Pre correlation analysis results (nearest neighbor data).
         if self.post_correlation_rows:
             self.save_text_lines(self.post_correlation_rows, os.path.join(self.dest_dir, 'CorrResults2.txt'))
+        
+        # Save the batch synapse report (accumulated from all images) as proper CSV
+        present_dir = os.path.join(self.dest_dir, 'present')
+        if not os.path.exists(present_dir):
+            os.makedirs(present_dir)
+
+        if self.batch_synapse_rows:
+            batch_path = os.path.join(present_dir, 'Batch_Synapse_Report.csv')
+            with open(batch_path, 'w') as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(self.batch_synapse_rows[0].keys()))
+                writer.writeheader()
+                for row in self.batch_synapse_rows:
+                    writer.writerow(row)
+            self.log("Saved Batch_Synapse_Report.csv with {} total rows".format(len(self.batch_synapse_rows)))
 
     def save_log(self):
         """Store the execution log (IFALog.txt) for provenance and debugging."""
@@ -1866,7 +1937,7 @@ class SynapseJ4ChannelComplete(object):
         """
         Calculate the area of a single pixel in square microns.
         
-        Used for converting pixel counts to physical area units (µm²).
+        Used for converting pixel counts to physical area units (um^2).
         If calibration is missing or invalid, defaults to 1.0 (pixels).
         
         Args:
@@ -2041,7 +2112,6 @@ class SynapseJ4ChannelComplete(object):
                                 # Check histogram for sufficient overlap with a single particle.
                                 # hist[0] is background (0).
                                 # hist[k] is the count of pixels belonging to partner particle ID k.
-                                hist = ip.getHistogram()
                                 for k in range(1, len(hist)):
                                     if hist[k] >= overlap_pixels:
                                         should_keep = True
@@ -2179,7 +2249,7 @@ class SynapseJ4ChannelComplete(object):
         
         def process_slice(slice_idx):
             try:
-                # Get the processor for this slice.
+                # Get the processor for this slice (slice_idx is already 1-based)
                 ip = stack.getProcessor(slice_idx)
                 
                 results = []
@@ -2493,9 +2563,29 @@ class SynapseJ4ChannelComplete(object):
 
                 # If we found at least one partner (VStar != -1), record the result.
                 if VStar != -1:
-                    partner_label_str = partner_entries[VStar-1]['metrics']['Label']
-                    # Format: AnchorLabel, NearestPartnerLabel, Count, TotalIntDen, [Details...]
-                    final_line = "{}\t{}\t{}\t{}{}".format(anchor_metrics['Label'], partner_label_str, VPerROI, VIDPerROI, lineP)
+                    partner_entry = partner_entries[VStar-1]
+                    partner_metrics = partner_entry['metrics']
+                    partner_label_str = partner_metrics['Label']
+                    
+                    # Helper to format metrics (excluding Label) matching RESULT_LABELS order
+                    # RESULT_LABELS is defined globally
+                    def fmt_metrics(m):
+                        return "\t".join([str(m.get(k, 0)) for k in RESULT_LABELS[1:]])
+                        
+                    anchor_data = fmt_metrics(anchor_metrics)
+                    partner_data = fmt_metrics(partner_metrics)
+                    
+                    # Format: AnchorLabel, AnchorMetrics, PartnerLabel, PartnerMetrics, Count, TotalIntDen, [Details...]
+                    # Matches CORR_HEADER structure
+                    final_line = "{}\t{}\t{}\t{}\t{}\t{}{}".format(
+                        anchor_metrics['Label'], 
+                        anchor_data,
+                        partner_label_str, 
+                        partner_data,
+                        VPerROI, 
+                        VIDPerROI, 
+                        lineP
+                    )
                     slice_results.append((idx, final_line))
             
             ip.resetRoi()
@@ -2717,10 +2807,7 @@ class SynapseJ4ChannelComplete(object):
                 new_ip.fill()
                 
                 # For each ROI in this slice, copy pixels from source to new
-                current_rois = rois_by_slice[slice_idx]
-                
-                # Optimization: If we have ROIs, we can use them to copy.
-                for roi in current_rois:
+                for roi in rois_by_slice[slice_idx]:
                     src_ip.setRoi(roi)
                     new_ip.setRoi(roi)
                     
@@ -2782,8 +2869,8 @@ class SynapseJ4ChannelComplete(object):
         # Create Merge: 
         # Channel 1 (Red): Post-synaptic Synaptic Puncta
         # Channel 2 (Green): Pre-synaptic Synaptic Puncta
-        # Channel 3 (Blue): Raw Post-Marker Channel (Context)
-        # Channel 4 (Gray): Raw Pre-Marker Channel (Context)
+        # Channel 3 (Blue): Raw Post-Marker Channel (C1)
+        # Channel 4 (Gray): Raw Pre-Marker Channel (C2)
         c1 = post_syn_imp # Red
         c2 = pre_syn_imp  # Green
         c3 = c1_imp.duplicate() # Blue
@@ -2801,15 +2888,12 @@ class SynapseJ4ChannelComplete(object):
         c3.close()
         c4.close()
 
-    def generate_presentation_outputs(self, base_name, pre_entries, post_entries, syn_pre_rois, syn_post_rois, cal, pre_result_imp, post_result_imp, c1_imp, c2_imp):
+    def generate_presentation_outputs(self, base_name, pre_entries, post_entries, syn_pre_rois, syn_post_rois, cal, pre_result_imp, post_result_imp):
         """
-        Generate user-friendly presentation outputs in a 'present' subfolder.
+        Generate presentation output: Batch_Synapse_Report.csv (accumulated).
         
-        These outputs are designed for easy visualization and reporting in presentations or papers.
-        They include:
-        1. A comprehensive CSV report with overlap statistics.
-        2. An "Overlap Mask" image showing the exact pixels where pre- and post-synaptic puncta intersect.
-        3. An "Annotated Map" showing all detected puncta, color-coded by type (Synaptic vs Isolated).
+        Creates Complete synapse rows linking Pre and Post IDs with geometry measurements.
+        Only accumulates to batch_synapse_rows which is saved at end of run.
         
         Args:
             base_name (str): Image name.
@@ -2820,245 +2904,201 @@ class SynapseJ4ChannelComplete(object):
             cal (Calibration): Image calibration.
             pre_result_imp (ImagePlus): Processed pre-synaptic image.
             post_result_imp (ImagePlus): Processed post-synaptic image.
-            c1_imp (ImagePlus): Original Post-Marker channel.
-            c2_imp (ImagePlus): Original Pre-Marker channel.
         """
-        present_dir = os.path.join(self.dest_dir, 'present')
-        if not os.path.exists(present_dir):
-            os.makedirs(present_dir)
-
-        # --- 1. Data Table ---
-        # Create sets for O(1) lookup of synaptic status.
-        syn_pre_set = set(syn_pre_rois)
-        syn_post_set = set(syn_post_rois)
+        synapse_rows = []
         
-        # Helper to calculate overlap statistics for a given ROI against a target image.
-        def get_overlap_stats(roi, target_imp, threshold=0):
-            if target_imp.getStackSize() > 1:
-                target_imp.setSlice(roi.getPosition())
-            target_imp.setRoi(roi)
-            stats = target_imp.getStatistics()
-            
-            # Count pixels > threshold
-            # If threshold is 0, we count non-zero pixels.
-            # If target_imp is raw intensity, we need a meaningful threshold.
-            # For result_imp (processed), >0 is correct.
-            
-            # Using histogram for efficiency if 8-bit or 16-bit
-            hist = target_imp.getProcessor().getHistogram()
-            overlap_px = 0
-            
-            # If threshold is 0, sum all bins from 1 to end
-            start_bin = int(threshold) + 1
-            if start_bin < len(hist):
-                overlap_px = sum(hist[start_bin:])
-                
-            pixel_area = self._pixel_area(cal)
-            overlap_area = overlap_px * pixel_area
-            
-            # ROI Area in pixels
-            roi_px = 0
-            if hasattr(stats, 'pixelCount'):
-                roi_px = stats.pixelCount
-            else:
-                # Fallback
-                roi_px = sum(hist) # Total pixels in ROI
-                
-            percent = (float(overlap_px) / float(roi_px) * 100.0) if roi_px > 0 else 0.0
-            return overlap_px, overlap_area, percent
-
-        report_rows = []
+        # Create ROI-to-entry lookup for quick access
+        pre_roi_to_entry = {entry['roi']: entry for entry in pre_entries}
+        post_roi_to_entry = {entry['roi']: entry for entry in post_entries}
         
-        # Process Pre-synaptic Puncta
-        for entry in pre_entries:
-            roi = entry['roi']
-            metrics = entry['metrics']
-            is_synaptic = roi in syn_pre_set
-            
-            # Overlap with Post (Synaptic Match)
-            # Use post_result_imp (processed channel)
-            ov_px, ov_area, ov_pct = get_overlap_stats(roi, post_result_imp, 0)
-            
-            # Overlap with Pre Marker (C2/Gray)
-            # Use c2_imp (raw) with pre_marker_min threshold
-            marker_ov_px, marker_ov_area, marker_ov_pct = 0, 0, 0
-            if self.pre_marker_thresholds:
-                marker_ov_px, marker_ov_area, marker_ov_pct = get_overlap_stats(roi, c2_imp, self.pre_marker_thresholds['min'])
-            
-            row = OrderedDict([
-                ('Image Name', base_name),
-                ('Puncta ID', metrics['Label']),
-                ('Channel', 'Presynaptic'),
-                ('Type', 'Synaptic' if is_synaptic else 'Isolated'),
-                ('X (um)', "{:.3f}".format(metrics['X'])),
-                ('Y (um)', "{:.3f}".format(metrics['Y'])),
-                ('Z (Slice)', roi.getPosition()),
-                ('Puncta Area (um^2)', "{:.3f}".format(metrics['Area'])),
-                ('Mean Intensity', "{:.1f}".format(metrics['Mean'])),
-                ('Min Intensity', "{:.1f}".format(metrics['Min'])),
-                ('Max Intensity', "{:.1f}".format(metrics['Max'])),
-                ('Integrated Density', "{:.1f}".format(metrics['IntDen'])),
-                ('Raw Integrated Density', "{:.1f}".format(metrics['RawIntDen'])),
-                ('Center of Mass X (um)', "{:.3f}".format(metrics['XM'])),
-                ('Center of Mass Y (um)', "{:.3f}".format(metrics['YM'])),
-                ('Perimeter (um)', "{:.3f}".format(metrics['Perim.'])),
-                ('Feret Diameter (um)', "{:.3f}".format(metrics['Feret'])),
-                ('Feret X (um)', "{:.3f}".format(metrics['FeretX'])),
-                ('Feret Y (um)', "{:.3f}".format(metrics['FeretY'])),
-                ('Feret Angle (deg)', "{:.1f}".format(metrics['FeretAngle'])),
-                ('Min Feret (um)', "{:.3f}".format(metrics['MinFeret'])),
-                ('Synaptic Overlap (px)', int(ov_px)),
-                ('Synaptic Overlap (um^2)', "{:.3f}".format(ov_area)),
-                ('Synaptic Overlap %', "{:.1f}".format(ov_pct)),
-                ('Marker Overlap (px)', int(marker_ov_px)),
-                ('Marker Overlap %', "{:.1f}".format(marker_ov_pct))
-            ])
-            report_rows.append(row)
-            
-        # Process Post-synaptic Puncta
-        for entry in post_entries:
-            roi = entry['roi']
-            metrics = entry['metrics']
-            is_synaptic = roi in syn_post_set
-            
-            # Overlap with Pre (Synaptic Match)
-            # Use pre_result_imp (processed channel)
-            ov_px, ov_area, ov_pct = get_overlap_stats(roi, pre_result_imp, 0)
-            
-            # Overlap with Post Marker (C1/Blue)
-            # Use c1_imp (raw) with post_marker_min threshold
-            marker_ov_px, marker_ov_area, marker_ov_pct = 0, 0, 0
-            if self.post_marker_thresholds:
-                marker_ov_px, marker_ov_area, marker_ov_pct = get_overlap_stats(roi, c1_imp, self.post_marker_thresholds['min'])
-            
-            row = OrderedDict([
-                ('Image Name', base_name),
-                ('Puncta ID', metrics['Label']),
-                ('Channel', 'Postsynaptic'),
-                ('Type', 'Synaptic' if is_synaptic else 'Isolated'),
-                ('X (um)', "{:.3f}".format(metrics['X'])),
-                ('Y (um)', "{:.3f}".format(metrics['Y'])),
-                ('Z (Slice)', roi.getPosition()),
-                ('Puncta Area (um^2)', "{:.3f}".format(metrics['Area'])),
-                ('Mean Intensity', "{:.1f}".format(metrics['Mean'])),
-                ('Min Intensity', "{:.1f}".format(metrics['Min'])),
-                ('Max Intensity', "{:.1f}".format(metrics['Max'])),
-                ('Integrated Density', "{:.1f}".format(metrics['IntDen'])),
-                ('Raw Integrated Density', "{:.1f}".format(metrics['RawIntDen'])),
-                ('Center of Mass X (um)', "{:.3f}".format(metrics['XM'])),
-                ('Center of Mass Y (um)', "{:.3f}".format(metrics['YM'])),
-                ('Perimeter (um)', "{:.3f}".format(metrics['Perim.'])),
-                ('Feret Diameter (um)', "{:.3f}".format(metrics['Feret'])),
-                ('Feret X (um)', "{:.3f}".format(metrics['FeretX'])),
-                ('Feret Y (um)', "{:.3f}".format(metrics['FeretY'])),
-                ('Feret Angle (deg)', "{:.1f}".format(metrics['FeretAngle'])),
-                ('Min Feret (um)', "{:.3f}".format(metrics['MinFeret'])),
-                ('Synaptic Overlap (px)', int(ov_px)),
-                ('Synaptic Overlap (um^2)', "{:.3f}".format(ov_area)),
-                ('Synaptic Overlap %', "{:.1f}".format(ov_pct)),
-                ('Marker Overlap (px)', int(marker_ov_px)),
-                ('Marker Overlap %', "{:.1f}".format(marker_ov_pct))
-            ])
-            report_rows.append(row)
-            
-        table_path = os.path.join(present_dir, "{}_Presentation_Report.csv".format(base_name))
-        self.save_results_table(report_rows, table_path)
-        
-        # --- 2. Overlap Image (Intersection Mask) ---
-        # This image shows ONLY the pixels that are common to both pre- and post-synaptic puncta.
-        # It is useful for visualizing the "synaptic interface".
+        # Process Complete Synapses (pairs of Pre and Post) in Parallel by Slice
         width = pre_result_imp.getWidth()
         height = pre_result_imp.getHeight()
         stack_size = pre_result_imp.getStackSize()
+        pre_res_stack = pre_result_imp.getStack()
         
-        overlap_stack = ImageStack(width, height)
-        
-        for i in range(1, stack_size + 1):
-            # Create Pre Mask (Binary)
-            pre_ip = ByteProcessor(width, height)
-            for roi in syn_pre_rois:
-                if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
-                    pre_ip.setValue(255)
-                    pre_ip.fill(roi)
+        def process_complete_slice(slice_idx):
+            # Get Pre and Post ROIs for this slice
+            slice_pre_rois = [roi for roi in syn_pre_rois if roi.getPosition() == slice_idx or (slice_idx == 1 and roi.getPosition() == 0)]
+            slice_post_rois = [roi for roi in syn_post_rois if roi.getPosition() == slice_idx or (slice_idx == 1 and roi.getPosition() == 0)]
             
-            # Create Post Mask (Binary)
-            post_ip = ByteProcessor(width, height)
-            for roi in syn_post_rois:
-                if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
-                    post_ip.setValue(255)
-                    post_ip.fill(roi)
+            if not slice_pre_rois or not slice_post_rois:
+                return []
             
-            # Intersect (AND operation)
-            # Result is 255 where both are 255, 0 otherwise.
-            pre_ip.copyBits(post_ip, 0, 0, Blitter.AND)
-            overlap_stack.addSlice(str(i), pre_ip)
-            
-        overlap_imp = ImagePlus(base_name + "_Overlap", overlap_stack)
-        overlap_imp.setCalibration(cal)
-        IJ.save(overlap_imp, os.path.join(present_dir, "{}_Overlap_Mask.tif".format(base_name)))
-        overlap_imp.close()
-        
-        # --- 3. Annotated Map (Schematic) ---
-        # This generates an RGB image where puncta are drawn as colored outlines/fills.
-        # It provides a clear "map" of the detected structures without the noise of the original image.
-        # Color Code:
-        # - Dark Green: Isolated Pre-synaptic
-        # - Dark Red: Isolated Post-synaptic
-        # - Bright Green: Synaptic Pre-synaptic
-        # - Bright Red: Synaptic Post-synaptic
-        
-        # Create RGB Stack
-        map_stack = ImageStack(width, height)
-        font = Font("SansSerif", Font.PLAIN, 10)
-        
-        for i in range(1, stack_size + 1):
-            # Create blank RGB
-            cp = ByteProcessor(width, height) # Black background
-            rgb_ip = cp.convertToRGB() 
-            rgb_ip.setFont(font)
-            
-            # Draw Isolated Pre (Dark Green)
-            rgb_ip.setColor(Color(0, 100, 0))
-            for entry in pre_entries:
-                roi = entry['roi']
-                if roi not in syn_pre_set:
-                    if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
-                        rgb_ip.draw(roi)
-                        
-            # Draw Isolated Post (Dark Red)
-            rgb_ip.setColor(Color(100, 0, 0))
-            for entry in post_entries:
-                roi = entry['roi']
-                if roi not in syn_post_set:
-                    if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
-                        rgb_ip.draw(roi)
+            # Get processor for measurements (thread-safe access)
+            measure_ip = pre_res_stack.getProcessor(slice_idx)
 
-            # Draw Synaptic Pre (Bright Green)
-            rgb_ip.setColor(Color.GREEN)
-            for roi in syn_pre_rois:
-                if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
-                    rgb_ip.draw(roi)
+            # Create label map for Pre ROIs
+            pre_label_ip = ByteProcessor(width, height)
+            pre_label_map = {}
+            for idx, roi in enumerate(slice_pre_rois):
+                label_val = idx + 1
+                pre_label_ip.setValue(label_val)
+                pre_label_ip.fill(roi)
+                pre_label_map[label_val] = roi
+            
+            slice_matches = []
+            
+            # For each Post ROI, find overlapping Pre ROIs
+            for post_roi in slice_post_rois:
+                pre_label_ip.setRoi(post_roi)
+                hist = pre_label_ip.getHistogram()
+                
+                # Find all Pre ROIs that overlap with this Post ROI
+                overlapping_pre_labels = []
+                for label_val in range(1, len(hist)):
+                    if hist[label_val] > 0:  # Has overlap
+                        overlapping_pre_labels.append(label_val)
+                
+                # Create Complete synapse entry for each Pre-Post pair
+                for pre_label in overlapping_pre_labels:
+                    pre_roi = pre_label_map[pre_label]
                     
-            # Draw Synaptic Post (Bright Red)
-            rgb_ip.setColor(Color.RED)
-            for roi in syn_post_rois:
-                if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
-                    rgb_ip.draw(roi)
+                    # Calculate overlap in pixels between Pre and Post ROIs
+                    overlap_px = hist[pre_label]
+                    
+                    # Get IDs from metrics
+                    pre_entry = pre_roi_to_entry.get(pre_roi)
+                    post_entry = post_roi_to_entry.get(post_roi)
+                    
+                    if not pre_entry or not post_entry:
+                        continue
+                    
+                    pre_id = pre_entry['metrics']['Label']
+                    post_id = post_entry['metrics']['Label']
+                    
+                    # --- Geometry Calculations ---
+                    from ij.gui import ShapeRoi
+                    pre_shape = ShapeRoi(pre_roi)
+                    post_shape = ShapeRoi(post_roi)
+                    
+                    # Intersection
+                    intersect_roi = getattr(pre_shape, 'and')(post_shape)
+                    intersect_area, intersect_perim, intersect_x, intersect_y = 0, 0, 0, 0
+                    intersect_feret, intersect_min_feret = 0, 0
+                    intersect_intden, intersect_rawintden = 0, 0
+                    
+                    if intersect_roi and intersect_roi.getBounds().width > 0:
+                        measure_ip.setRoi(intersect_roi)
+                        i_stats = ImageStatistics.getStatistics(measure_ip, MEASUREMENT_FLAGS, cal)
+                        intersect_area = i_stats.area
+                        intersect_perim = getattr(i_stats, 'perimeter', 0)
+                        if intersect_perim == 0:
+                            intersect_perim = intersect_roi.getLength()
+                        intersect_x, intersect_y = i_stats.xCentroid, i_stats.yCentroid
+                        intersect_intden = getattr(i_stats, 'integratedDensity', i_stats.area * i_stats.mean)
+                        intersect_rawintden = getattr(i_stats, 'rawIntegratedDensity', i_stats.pixelCount * i_stats.mean)
+                        
+                        i_feret_vals = intersect_roi.getFeretValues()
+                        intersect_feret = i_feret_vals[0] if i_feret_vals else (2 * math.sqrt(intersect_area / math.pi) if intersect_area > 0 else 0)
+                        intersect_min_feret = i_feret_vals[2] if i_feret_vals else 0
+
+                    # Union
+                    union_roi = getattr(pre_shape, 'or')(post_shape)
+                    union_area, union_perim, union_x, union_y = 0, 0, 0, 0
+                    union_feret, union_min_feret = 0, 0
+                    union_intden, union_rawintden = 0, 0
+                    
+                    if union_roi and union_roi.getBounds().width > 0:
+                        measure_ip.setRoi(union_roi)
+                        u_stats = ImageStatistics.getStatistics(measure_ip, MEASUREMENT_FLAGS, cal)
+                        union_area = u_stats.area
+                        union_perim = getattr(u_stats, 'perimeter', 0)
+                        if union_perim == 0:
+                            union_perim = union_roi.getLength()
+                        union_x, union_y = u_stats.xCentroid, u_stats.yCentroid
+                        union_intden = getattr(u_stats, 'integratedDensity', u_stats.area * u_stats.mean)
+                        union_rawintden = getattr(u_stats, 'rawIntegratedDensity', u_stats.pixelCount * u_stats.mean)
+                        
+                        u_feret_vals = union_roi.getFeretValues()
+                        union_feret = u_feret_vals[0] if u_feret_vals else (2 * math.sqrt(union_area / math.pi) if union_area > 0 else 0)
+                        union_min_feret = u_feret_vals[2] if u_feret_vals else 0
+
+                    # Distances
+                    pre_m = pre_entry['metrics']
+                    post_m = post_entry['metrics']
+                    geo_dist = math.sqrt((pre_m['X'] - post_m['X'])**2 + (pre_m['Y'] - post_m['Y'])**2)
+                    int_dist = math.sqrt((pre_m['XM'] - post_m['XM'])**2 + (pre_m['YM'] - post_m['YM'])**2)
+
+                    slice_matches.append({
+                        'pre_id': pre_id,
+                        'post_id': post_id,
+                        'overlap_px': overlap_px,
+                        'intersect_area': intersect_area,
+                        'intersect_perim': intersect_perim,
+                        'intersect_x': intersect_x,
+                        'intersect_y': intersect_y,
+                        'intersect_feret': intersect_feret,
+                        'intersect_min_feret': intersect_min_feret,
+                        'intersect_intden': intersect_intden,
+                        'intersect_rawintden': intersect_rawintden,
+                        'union_area': union_area,
+                        'union_perim': union_perim,
+                        'union_x': union_x,
+                        'union_y': union_y,
+                        'union_feret': union_feret,
+                        'union_min_feret': union_min_feret,
+                        'union_intden': union_intden,
+                        'union_rawintden': union_rawintden,
+                        'geo_dist': geo_dist,
+                        'int_dist': int_dist
+                    })
+            return slice_matches
+
+        # Run slice processing in parallel
+        slice_indices = list(range(1, stack_size + 1))
+        
+        def slice_task(i):
+            return process_complete_slice(slice_indices[i])
             
-            # Draw Labels (White)
-            rgb_ip.setColor(Color.WHITE)
-            # Label Synaptic Pre
-            for idx, roi in enumerate(syn_pre_rois):
-                if roi.getPosition() == i or (stack_size == 1 and roi.getPosition() == 0):
-                    bounds = roi.getBounds()
-                    rgb_ip.drawString("P:{}".format(idx+1), bounds.x, bounds.y)
-            
-            map_stack.addSlice(str(i), rgb_ip)
-            
-        map_imp = ImagePlus(base_name + "_Annotated_Map", map_stack)
-        map_imp.setCalibration(cal)
-        IJ.save(map_imp, os.path.join(present_dir, "{}_Annotated_Map.tif".format(base_name)))
-        map_imp.close()
+        all_slice_matches = ParallelUtils.parallel_for(slice_task, len(slice_indices))
+        
+        # Flatten results and assign IDs sequentially
+        complete_synapse_id = 1
+        for slice_matches in all_slice_matches:
+            for match in slice_matches:
+                # Create Complete ID
+                complete_id = "{}:Comp:{}".format(base_name, complete_synapse_id)
+                complete_synapse_id += 1
+                
+                overlap_px = match['overlap_px']
+                
+                # Synapse row - columns renamed (Pre ID, Post ID) and no BBox
+                row = OrderedDict([
+                    ('Image Name', base_name),
+                    ('Puncta ID', complete_id),
+                    ('Included Channels', 'C1,C2,C3,C4'),
+                    ('Type', 'Complete'),
+                    ('Overlap (px)', overlap_px),
+                    ('Overlap (um^2)', overlap_px * self._pixel_area(cal)),
+                    ('Pre ID', match['pre_id']),
+                    ('Post ID', match['post_id']),
+                    # Synapse Geometry (no BBox)
+                    ('Intersect Area (um^2)', match['intersect_area']),
+                    ('Intersect Perim (um)', match['intersect_perim']),
+                    ('Intersect Centroid X (um)', match['intersect_x']),
+                    ('Intersect Centroid Y (um)', match['intersect_y']),
+                    ('Intersect Feret (um)', match['intersect_feret']),
+                    ('Intersect Min Feret (um)', match['intersect_min_feret']),
+                    ('Intersect IntDen', match['intersect_intden']),
+                    ('Intersect RawIntDen', match['intersect_rawintden']),
+                    ('Union Area (um^2)', match['union_area']),
+                    ('Union Perim (um)', match['union_perim']),
+                    ('Union Centroid X (um)', match['union_x']),
+                    ('Union Centroid Y (um)', match['union_y']),
+                    ('Union Feret (um)', match['union_feret']),
+                    ('Union Min Feret (um)', match['union_min_feret']),
+                    ('Union IntDen', match['union_intden']),
+                    ('Union RawIntDen', match['union_rawintden']),
+                    ('Geo Distance (um)', match['geo_dist']),
+                    ('Int Distance (um)', match['int_dist'])
+                ])
+                synapse_rows.append(row)
+        
+        # Add to batch accumulator (no individual file saves)
+        self.batch_synapse_rows.extend(synapse_rows)
+        
+        self.log("Generated {} synapse rows for batch report".format(len(synapse_rows)))
 
 from java.util.concurrent import Executors, Callable, Future, TimeUnit
 from java.util import ArrayList
@@ -3178,6 +3218,7 @@ def main():
         System.exit(1)
 
     try:
+        print("Starting Pynapse with config: {}".format(config_path))
         # 2. Initialize Analyzer
         #    Create an instance of the main class. This parses the config file,
         #    validates parameters, and sets up the output directory structure.
