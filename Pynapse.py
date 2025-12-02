@@ -951,14 +951,18 @@ class SynapseJ4ChannelComplete(object):
         all_pre_rows = [entry['metrics'] for entry in pre_entries]
         all_post_rows = [entry['metrics'] for entry in post_entries]
         
+        # Save the ALL ROI sets and capture the index maps for subset saving
+        pre_roi_index_map = {}
+        post_roi_index_map = {}
+        
         if all_pre_rows:
             self.all_pre_results.extend(all_pre_rows)
             self.save_results_table(self._filter_all_results_metrics(all_pre_rows), os.path.join(self.dest_dir, '{}Pre.txt'.format(name_short)))
-            self.save_roi_set([entry['roi'] for entry in pre_entries], os.path.join(self.dest_dir, '{}PreALLRoiSet.zip'.format(name_short)), pre_result_imp)
+            pre_roi_index_map = self.save_roi_set([entry['roi'] for entry in pre_entries], os.path.join(self.dest_dir, '{}PreALLRoiSet.zip'.format(name_short)), pre_result_imp)
         if all_post_rows:
             self.all_post_results.extend(all_post_rows)
             self.save_results_table(self._filter_all_results_metrics(all_post_rows), os.path.join(self.dest_dir, '{}Post.txt'.format(name_short)))
-            self.save_roi_set([entry['roi'] for entry in post_entries], os.path.join(self.dest_dir, '{}PostALLRoiSet.zip'.format(name_short)), post_result_imp)
+            post_roi_index_map = self.save_roi_set([entry['roi'] for entry in post_entries], os.path.join(self.dest_dir, '{}PostALLRoiSet.zip'.format(name_short)), post_result_imp)
 
         # --- Marker Channel Gating ---
         # If a marker channel (e.g., MAP2 for dendrites) is defined, we filter the detected puncta.
@@ -999,8 +1003,9 @@ class SynapseJ4ChannelComplete(object):
             self.log("Presynaptic marker gating: %d/%d puncta retained" % (pre_marker_count, pre_count_total))
             
             # Save PreThrRoiSet.zip AFTER marker gating (this is the filtered set)
+            # Use pre_roi_index_map to preserve original indices from PreALLRoiSet
             if pre_marker_count > 0:
-                self.save_roi_set([entry['roi'] for entry in pre_entries], os.path.join(self.dest_dir, '{}PreThrRoiSet.zip'.format(name_short)), pre_result_imp)
+                self.save_roi_set([entry['roi'] for entry in pre_entries], os.path.join(self.dest_dir, '{}PreThrRoiSet.zip'.format(name_short)), pre_result_imp, pre_roi_index_map)
             
             # Clean up temporary images.
             processed_marker.close()
@@ -1029,8 +1034,9 @@ class SynapseJ4ChannelComplete(object):
             self.log("Postsynaptic marker gating: %d/%d puncta retained" % (post_marker_count, post_count_total))
             
             # Save PstRRoiSet.zip AFTER marker gating (this is the filtered set)
+            # Use post_roi_index_map to preserve original indices from PostALLRoiSet
             if post_marker_count > 0:
-                self.save_roi_set([entry['roi'] for entry in post_entries], os.path.join(self.dest_dir, '{}PstRRoiSet.zip'.format(name_short)), post_result_imp)
+                self.save_roi_set([entry['roi'] for entry in post_entries], os.path.join(self.dest_dir, '{}PstRRoiSet.zip'.format(name_short)), post_result_imp, post_roi_index_map)
             
             # Clean up.
             processed_marker.close()
@@ -1065,7 +1071,8 @@ class SynapseJ4ChannelComplete(object):
             self.syn_pre_results.extend(syn_pre_rows)
             # Per-image synaptic pre-synaptic results (Excel folder) + per-macro aggregate
             self.save_results_table(self._filter_standard_metrics(syn_pre_rows), os.path.join(self.excel_dir, '{}PreResults.txt'.format(name_short)))
-            self.save_roi_set(syn_pre_rois, os.path.join(self.dest_dir, '{}PreSYNRoiSet.zip'.format(name_short)), pre_result_imp)
+            # Use pre_roi_index_map to preserve original indices from PreALLRoiSet
+            self.save_roi_set(syn_pre_rois, os.path.join(self.dest_dir, '{}PreSYNRoiSet.zip'.format(name_short)), pre_result_imp, pre_roi_index_map)
 
         if syn_post_rois:
             syn_post_rows = self.measure_rois(syn_post_rois, post_result_imp, name_short, 'Post', cal,
@@ -1073,7 +1080,8 @@ class SynapseJ4ChannelComplete(object):
             self.syn_post_results.extend(syn_post_rows)
             # Per-image synaptic post-synaptic results (Excel folder) + per-macro aggregate
             self.save_results_table(self._filter_standard_metrics(syn_post_rows), os.path.join(self.excel_dir, '{}PostResults.txt'.format(name_short)))
-            self.save_roi_set(syn_post_rois, os.path.join(self.dest_dir, '{}PostSYNRoiSet.zip'.format(name_short)), post_result_imp)
+            # Use post_roi_index_map to preserve original indices from PostALLRoiSet
+            self.save_roi_set(syn_post_rois, os.path.join(self.dest_dir, '{}PostSYNRoiSet.zip'.format(name_short)), post_result_imp, post_roi_index_map)
 
         # Always save filtered images, even if no synapses were detected, to match macro behavior.
         # These images show the puncta after background subtraction and masking.
@@ -1999,7 +2007,7 @@ class SynapseJ4ChannelComplete(object):
                 else:
                     handle.write('\t'.join(values) + '\n')
 
-    def save_roi_set(self, rois, path, imp=None):
+    def save_roi_set(self, rois, path, imp=None, roi_index_map=None):
         """
         Save a list of ROIs to a ZIP file (ImageJ ROI Set).
         
@@ -2010,7 +2018,8 @@ class SynapseJ4ChannelComplete(object):
         The ROI naming follows the ImageJ RoiManager convention when ROIs are
         added via Analyze Particles: SSSS-NNNN-YYYY.roi where:
         - S = slice position (1-based)
-        - N = sequential index (1-based) 
+        - N = sequential index (1-based, resets per slice for full sets, 
+              or preserved from parent set for subsets)
         - Y = y-center of the ROI bounds
         
         For single-slice images, format is NNNN-YYYY.roi.
@@ -2021,10 +2030,17 @@ class SynapseJ4ChannelComplete(object):
             rois (list): List of Roi objects to save.
             path (str): Output path (should end in .zip).
             imp (ImagePlus, optional): Image for determining stack size and digit width.
+            roi_index_map (dict, optional): If provided, maps ROI objects to their 
+                original (slice, per_slice_index) tuple. Used when saving subsets to 
+                preserve the original indices from the parent set.
+                
+        Returns:
+            dict: A mapping of ROI objects to their (slice, per_slice_index) tuples.
+                  This can be passed to subsequent calls for subset saving.
         """
         # If no ROIs to save, exit.
         if not rois:
-            return
+            return {}
             
         # Ensure the parent directory exists.
         parent = os.path.dirname(path)
@@ -2033,19 +2049,21 @@ class SynapseJ4ChannelComplete(object):
         
         # Determine number of digits needed for coordinate/slice fields.
         # ImageJ uses at least 4 digits, more if image dimensions require it.
+        # Matches ImageJ's getLabel logic in RoiManager.java:
+        #   - Start with 4 digits
+        #   - Expand to 5 if stack size >= 10000 OR image height >= 10000
+        #   - Also expand if the x or y center value string is > 4 chars
         digits = 4
         if imp is not None:
-            # Check if we need more digits based on image dimensions or stack size
-            max_dim = max(imp.getWidth(), imp.getHeight())
-            if max_dim >= 10000:
-                digits = 5
-            if imp.getStackSize() >= 10000:
-                digits = 5
-            # Also check total ROI count
-            if len(rois) >= 10000:
+            # Check if we need more digits based on stack size or image height
+            if imp.getStackSize() >= 10000 or imp.getHeight() >= 10000:
                 digits = 5
         
         is_stack = imp is not None and imp.getStackSize() > 1
+        
+        # Build the index map if not provided (for full sets)
+        # or use the provided map (for subsets)
+        new_roi_index_map = {}
             
         # Create a ZipOutputStream to write the .zip file.
         # We wrap a FileOutputStream in a BufferedOutputStream for performance.
@@ -2067,22 +2085,51 @@ class SynapseJ4ChannelComplete(object):
                     if slice_pos <= 0:
                         slice_pos = 1  # Default to slice 1 if not set
                     
-                    # Reset index when slice changes (ImageJ RoiManager behavior)
-                    if slice_pos != current_slice:
-                        current_slice = slice_pos
-                        slice_index = 0
-                    slice_index += 1
+                    # Check if we have a pre-computed index from a parent set
+                    if roi_index_map is not None and roi in roi_index_map:
+                        # Use the original index from the parent set
+                        orig_slice, orig_idx = roi_index_map[roi]
+                        slice_pos = orig_slice
+                        slice_index = orig_idx
+                    else:
+                        # Compute new index (resets per slice)
+                        if slice_pos != current_slice:
+                            current_slice = slice_pos
+                            slice_index = 0
+                        slice_index += 1
+                        # Store for potential subset use
+                        new_roi_index_map[roi] = (slice_pos, slice_index)
                     
-                    # Format with leading zeros
-                    zs = str(slice_pos).zfill(digits)
-                    ns = str(slice_index).zfill(digits)
-                    ys = str(yc).zfill(digits)
+                    # ImageJ dynamically expands digits if index or y-center needs more chars
+                    # This matches the getLabel() logic where digits is adjusted per-ROI
+                    local_digits = digits
+                    if len(str(slice_index)) > local_digits:
+                        local_digits = len(str(slice_index))
+                    if len(str(yc)) > local_digits:
+                        local_digits = len(str(yc))
+                    
+                    # Format with leading zeros - all fields use same digit count
+                    zs = str(slice_pos).zfill(local_digits)
+                    ns = str(slice_index).zfill(local_digits)
+                    ys = str(yc).zfill(local_digits)
                     label = '{}-{}-{}.roi'.format(zs, ns, ys)
                 else:
-                    # For single-slice, use global 1-based index
-                    n = idx + 1
-                    ns = str(n).zfill(digits)
-                    ys = str(yc).zfill(digits)
+                    # For single-slice, use global 1-based index or from map
+                    if roi_index_map is not None and roi in roi_index_map:
+                        _, n = roi_index_map[roi]
+                    else:
+                        n = idx + 1
+                        new_roi_index_map[roi] = (1, n)
+                    
+                    # ImageJ dynamically expands digits
+                    local_digits = digits
+                    if len(str(n)) > local_digits:
+                        local_digits = len(str(n))
+                    if len(str(yc)) > local_digits:
+                        local_digits = len(str(yc))
+                    
+                    ns = str(n).zfill(local_digits)
+                    ys = str(yc).zfill(local_digits)
                     label = '{}-{}.roi'.format(ns, ys)
                 
                 # Create a new entry in the zip file for this ROI.
@@ -2100,6 +2147,9 @@ class SynapseJ4ChannelComplete(object):
         finally:
             # Ensure the stream is closed to flush data to disk.
             stream.close()
+        
+        # Return the index map for use by subset saves
+        return new_roi_index_map
 
     def save_overlay(self, pre_src, post_src, c1_imp, c2_imp, base_name):
         """
