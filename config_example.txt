@@ -6,11 +6,11 @@
 source_dir=/path/to/your/images
 dest_dir=/path/to/output
 
-# Channel assignments (1-indexed, 0 = disabled)
+# Channel assignments
 pre_channel=4
 post_channel=3
-pre_marker_channel=0
-post_marker_channel=0
+pre_marker_channel=2
+post_marker_channel=1
 
 # Pre-synaptic detection parameters
 pre_min=658
