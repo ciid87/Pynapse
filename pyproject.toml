@@ -1,0 +1,71 @@
+[project]
+name = "pynapse"
+version = "1.0.0"
+description = "Headless Fiji/Jython recreation of SynapseJ macro for automated synapse detection"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Pynapse Contributors"}
+]
+keywords = ["synapse", "neuroscience", "imagej", "fiji", "image-analysis", "colocalization"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+# No runtime dependencies - the main script runs in Jython within Fiji
+# These are only for the validation/testing scripts
+dependencies = [
+    "numpy>=1.20",
+    "pandas>=1.3",
+    "pillow>=8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+pynapse-validate = "simple_validate:main"
+
+[project.urls]
+Repository = "https://github.com/your-org/pynapse"
+Documentation = "https://github.com/your-org/pynapse#readme"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["PynapseJ"]
+
+[tool.uv]
+# uv-specific configuration
+dev-dependencies = [
+    "pytest>=7.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # Line too long - handled by line-length setting

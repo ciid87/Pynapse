@@ -1,0 +1,43 @@
+# Pynapse Configuration File
+# ==========================
+# Edit these paths and parameters for your analysis
+
+# Input/Output directories (use absolute paths)
+source_dir=/path/to/your/images
+dest_dir=/path/to/output
+
+# Channel assignments (1-indexed, 0 = disabled)
+pre_channel=4
+post_channel=3
+pre_marker_channel=0
+post_marker_channel=0
+
+# Pre-synaptic detection parameters
+pre_min=658
+pre_noise=350
+pre_size_low=0.08
+pre_size_high=2.5
+pre_blur=true
+pre_blur_radius=2
+pre_bkd=0
+pre_use_maxima=true
+
+# Post-synaptic detection parameters
+post_min=578
+post_noise=350
+post_size_low=0.08
+post_size_high=2.5
+post_blur=true
+post_blur_radius=2
+post_bkd=0
+post_use_maxima=true
+
+# Overlap detection
+overlap_pixels=1
+dilate_pixels=0
+
+# Stack processing
+slice_number=5
+
+# Visualization
+grid_size=80
