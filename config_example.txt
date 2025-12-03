@@ -3,8 +3,8 @@
 # Edit these paths and parameters for your analysis
 
 # Input/Output directories (use absolute paths)
-source_dir=/path/to/your/images
-dest_dir=/path/to/output
+source_dir=/home/bob/images
+dest_dir=/path/bob/pynapse_out
 
 # Channel assignments
 pre_channel=4
