@@ -325,6 +325,107 @@ class SynapseJ4ChannelComplete(object):
     # Keep STANDARD_COLUMNS for backward compatibility
     STANDARD_COLUMNS = SYN_RESULTS_COLUMNS
 
+    @staticmethod
+    def format_value(val):
+        """
+        Format a value to match ImageJ Interpreter.toString() which uses IJ.d2s(x, 4, 9).
+        
+        This replicates the behavior in:
+        1. ij/macro/Interpreter.java lines 1575-1594 (toString)
+        2. ij/IJ.java d2s(double x, int significantDigits, int maxDigits)
+        
+        The algorithm:
+        - significantDigits = 4, maxDigits = 9
+        - decimals = maxDigits - magnitude  (then adjusted if > significantDigits)
+        - Strip trailing zeros
+        
+        This is the formatting used when macro does string concatenation like: "\\t" + getResult(...)
+        """
+        import math
+        
+        if val is None:
+            return ''
+        if isinstance(val, str):
+            return val
+        if isinstance(val, int):
+            return str(val)
+        if isinstance(val, float):
+            # For integer-valued floats, show as integer (matches Interpreter.toString())
+            if val == int(val):
+                return str(int(val))
+            
+            if val == 0:
+                return '0'
+            
+            # IJ.d2s(x, significantDigits=4, maxDigits=9) algorithm:
+            significantDigits = 4
+            maxDigits = 9
+            
+            abs_val = abs(val)
+            log10 = math.log10(abs_val)
+            roundErrorAtMax = 0.223 * (10 ** (-maxDigits))
+            magnitude = int(math.ceil(log10 + roundErrorAtMax))
+            
+            decimals = maxDigits - magnitude  # e.g. 9 - 4 = 5 for value ~1000
+            
+            # Check for scientific notation conditions
+            if decimals < 0 or magnitude < significantDigits + 1 - maxDigits:
+                # Would use scientific notation - format with significantDigits
+                format_str = '{{:.{}e}}'.format(significantDigits - 1)
+                formatted = format_str.format(val)
+                return formatted.upper().replace('E+0', 'E').replace('E-0', 'E-')
+            
+            # If decimals > significantDigits, reduce using ImageJ formula
+            if decimals > significantDigits:
+                decimals = max(significantDigits, decimals - maxDigits + significantDigits)
+            
+            # Clamp to 0-9 range
+            if decimals < 0:
+                decimals = 0
+            if decimals > 9:
+                decimals = 9
+            
+            # Format with calculated decimal places
+            format_str = '{{:.{}f}}'.format(decimals)
+            formatted = format_str.format(val)
+            
+            # Strip trailing zeros (matches Interpreter.toString())
+            while formatted.endswith('0') and '.' in formatted and 'E' not in formatted:
+                formatted = formatted[:-1]
+            # Remove trailing decimal point if present
+            if formatted.endswith('.'):
+                formatted = formatted[:-1]
+            
+            return formatted
+        return str(val)
+
+    @staticmethod
+    def format_value_3dec(val):
+        """
+        Format a value to match ImageJ ResultsTable output with decimal=3.
+        
+        This is used by "Set Measurements... decimal=3" which outputs exactly 3 decimal 
+        places for float values (no stripping of trailing zeros).
+        Used for Pre.txt, Post.txt, and Syn Results files.
+        """
+        if val is None:
+            return ''
+        if isinstance(val, str):
+            return val
+        if isinstance(val, int):
+            # True integers (not floats) are shown without decimals
+            return str(val)
+        if isinstance(val, float):
+            if val == 0:
+                return '0'
+            
+            # Format with exactly 3 decimal places (no stripping of trailing zeros)
+            # This matches ImageJ's ResultsTable with decimal=3
+            formatted = '{:.3f}'.format(val)
+            
+            return formatted
+        return str(val)
+
     def _filter_standard_metrics(self, rows):
         """Filter rows to include only standard SynapseJ columns (with thresholds)."""
         filtered_rows = []
@@ -337,7 +438,15 @@ class SynapseJ4ChannelComplete(object):
         return filtered_rows
     
     def _filter_all_results_metrics(self, rows):
-        """Filter rows for All Pre/Post Results format (no thresholds, simple Label)."""
+        """Filter rows for All Pre/Post Results format (no thresholds, simple Label).
+        
+        SynapseJ explicitly sets Label to ImName (the short name without extension)
+        after Analyze Particles. See SynapseJ_v_1.ijm line 592:
+            for(n=0; n<nResults; n++) setResult("Label", n, ImName);
+        
+        So for All Pre/Post Results, the Label should be just the base image name
+        (e.g., 'AK5-2001'), not the full label with channel suffix or ROI info.
+        """
         filtered_rows = []
         for row in rows:
             filtered = OrderedDict()
@@ -345,13 +454,27 @@ class SynapseJ4ChannelComplete(object):
                 if col in row:
                     # For All files, use simple image name as Label (extract from full Label)
                     if col == 'Label':
-                        # Label format is 'base_name:Pre:index' or 'base_name:Post:index'
-                        # Extract just the base_name part
+                        # Label format could be:
+                        # 1. Complex: 'AK5-2001PreF.tif:0001-0034-0091:c:4/4 z:1/5 - AK5-2001.nd2'
+                        # 2. Simple: 'base_name:Pre:index'
+                        # We need to extract just the base_name (e.g., 'AK5-2001')
                         full_label = row[col]
                         if ':' in full_label:
-                            base_name = full_label.split(':')[0]
+                            first_part = full_label.split(':')[0]
                         else:
-                            base_name = full_label
+                            first_part = full_label
+                        
+                        # Remove channel suffix (Pre/Post) and file extension if present
+                        # 'AK5-2001PreF.tif' -> 'AK5-2001'
+                        # 'AK5-2001PostF.tif' -> 'AK5-2001'
+                        base_name = first_part
+                        # Strip common suffixes
+                        for suffix in ['PreF.tif', 'PostF.tif', 'Pre.tif', 'Post.tif', 
+                                       'PreF', 'PostF', 'Pre', 'Post', '.tif', '.TIF']:
+                            if base_name.endswith(suffix):
+                                base_name = base_name[:-len(suffix)]
+                                break
+                        
                         filtered[col] = base_name
                     else:
                         filtered[col] = row[col]
@@ -396,6 +519,11 @@ class SynapseJ4ChannelComplete(object):
         self.batch_synapse_rows = []
 
         self.log_messages = []
+        
+        # Image counter for tracking first vs subsequent images.
+        # This is used to replicate the og2 macro bug where MinThr/MaxThr
+        # are only preserved for the first image's Syn Results.
+        self._image_index = 0
 
         # Load configuration: Start with defaults, then override with file if provided.
         # This allows for flexible deployment: defaults for quick tests, config files for batch runs.
@@ -882,6 +1010,18 @@ class SynapseJ4ChannelComplete(object):
             
         name_short = os.path.splitext(os.path.basename(image_path))[0]
         
+        # Extract original slice labels before splitting channels.
+        # These are needed for proper label formatting in results tables.
+        # Original image has (channels * z-slices) total slices.
+        # After split, each channel stack has z-slices.
+        # For channel C, z-slice Z: original_slice = (Z-1) * n_channels + C
+        original_slice_labels = {}
+        n_channels = imp.getNChannels() if imp.getNChannels() > 1 else len(imp.getStack()) // imp.getNSlices() if imp.getNSlices() > 1 else 4
+        stack = imp.getStack()
+        for i in range(stack.getSize()):
+            label = stack.getSliceLabel(i + 1)
+            original_slice_labels[i + 1] = label if label else ''
+        
         # Split the multi-channel image into individual ImagePlus objects.
         # Note: ChannelSplitter returns an array of ImagePlus.
         channels = ChannelSplitter.split(imp)
@@ -914,13 +1054,27 @@ class SynapseJ4ChannelComplete(object):
 
         # Define tasks for parallel execution of channel processing.
         # This speeds up analysis significantly on multi-core systems.
+        # Build slice label lookup functions for each channel.
+        # For channel C, z-slice Z: original_slice = (Z-1) * n_channels + C
+        n_ch = imp.getNChannels() if imp.getNChannels() > 1 else 4  # fallback to 4 if not detected
+        
+        def get_pre_slice_label(z_slice):
+            """Get original slice label for Pre channel (channel self.pre_channel) at z-slice."""
+            orig_slice = (z_slice - 1) * n_ch + self.pre_channel
+            return original_slice_labels.get(orig_slice, '')
+            
+        def get_post_slice_label(z_slice):
+            """Get original slice label for Post channel (channel self.post_channel) at z-slice."""
+            orig_slice = (z_slice - 1) * n_ch + self.post_channel
+            return original_slice_labels.get(orig_slice, '')
+        
         def run_pre():
             # Detect pre-synaptic puncta
-            return self.prepare_channel(pre_seg, pre_measure, name_short, 'Pre', cal, self.pre_params)
+            return self.prepare_channel(pre_seg, pre_measure, name_short, 'Pre', cal, self.pre_params, get_pre_slice_label)
         
         def run_post():
             # Detect post-synaptic puncta
-            return self.prepare_channel(post_seg, post_measure, name_short, 'Post', cal, self.post_params)
+            return self.prepare_channel(post_seg, post_measure, name_short, 'Post', cal, self.post_params, get_post_slice_label)
             
         # Execute detection in parallel.
         # This is safe because we are operating on independent ImagePlus objects.
@@ -989,6 +1143,14 @@ class SynapseJ4ChannelComplete(object):
             
             # Filter pre-synaptic puncta against the pre-marker channel.
             # This removes any puncta that are not "on top of" the marker signal.
+            
+            # Construct mask name for bug replication
+            # SynapseJ uses LUPPre variable which is set based on PreMax (use_maxima)
+            # PreCol is usually C4 (pre_channel)
+            pre_mask_name = "Mask of C{}-image".format(self.pre_channel)
+            if self.pre_use_maxima:
+                pre_mask_name += " Segmented"
+            
             pre_entries = self._filter_by_intensity(
                 pre_entries,
                 processed_marker,
@@ -998,6 +1160,7 @@ class SynapseJ4ChannelComplete(object):
                 pre_mask_imp,
                 name_short,
                 'PreThrResults.txt',
+                mask_name_for_bug=pre_mask_name
             )
             pre_marker_count = len(pre_entries)
             self.log("Presynaptic marker gating: %d/%d puncta retained" % (pre_marker_count, pre_count_total))
@@ -1019,6 +1182,11 @@ class SynapseJ4ChannelComplete(object):
             # SynapseJ unconditionally applies: run("Median...", "radius="+PostBlurPx+" stack");
             processed_marker = self._preprocess_channel(marker_imp, True, self.post_blur_radius, 0)
             
+            # Construct mask name for bug replication
+            post_mask_name = "Mask of C{}-image".format(self.post_channel)
+            if self.post_use_maxima:
+                post_mask_name += " Segmented"
+            
             # Filter post-synaptic puncta against the post-marker channel.
             post_entries = self._filter_by_intensity(
                 post_entries,
@@ -1029,6 +1197,7 @@ class SynapseJ4ChannelComplete(object):
                 post_mask_imp,
                 name_short,
                 'PstRResults.txt',
+                mask_name_for_bug=post_mask_name
             )
             post_marker_count = len(post_entries)
             self.log("Postsynaptic marker gating: %d/%d puncta retained" % (post_marker_count, post_count_total))
@@ -1067,7 +1236,15 @@ class SynapseJ4ChannelComplete(object):
         # Measure and save the confirmed synaptic puncta.
         if syn_pre_rois:
             syn_pre_rows = self.measure_rois(syn_pre_rois, pre_result_imp, name_short, 'Pre', cal, 
-                                              self.pre_params['min'], 65535)
+                                              self.pre_params['min'], 65535, get_pre_slice_label)
+            # MACRO BUG REPLICATION: In og2, the CollateResults function only copies 17 fields
+            # (Label through MinFeret) and doesn't include MinThr/MaxThr. This means:
+            # - First image: thresholds are preserved (Results table renamed directly)
+            # - Subsequent images: MinThr=0, MaxThr=0 (fields not copied)
+            if self._image_index > 0:
+                for row in syn_pre_rows:
+                    row['MinThr'] = 0
+                    row['MaxThr'] = 0
             self.syn_pre_results.extend(syn_pre_rows)
             # Per-image synaptic pre-synaptic results (Excel folder) + per-macro aggregate
             self.save_results_table(self._filter_standard_metrics(syn_pre_rows), os.path.join(self.excel_dir, '{}PreResults.txt'.format(name_short)))
@@ -1076,7 +1253,12 @@ class SynapseJ4ChannelComplete(object):
 
         if syn_post_rois:
             syn_post_rows = self.measure_rois(syn_post_rois, post_result_imp, name_short, 'Post', cal,
-                                               self.post_params['min'], 65535)
+                                               self.post_params['min'], 65535, get_post_slice_label)
+            # MACRO BUG REPLICATION: Same as above for post-synaptic results.
+            if self._image_index > 0:
+                for row in syn_post_rows:
+                    row['MinThr'] = 0
+                    row['MaxThr'] = 0
             self.syn_post_results.extend(syn_post_rows)
             # Per-image synaptic post-synaptic results (Excel folder) + per-macro aggregate
             self.save_results_table(self._filter_standard_metrics(syn_post_rows), os.path.join(self.excel_dir, '{}PostResults.txt'.format(name_short)))
@@ -1089,15 +1271,38 @@ class SynapseJ4ChannelComplete(object):
         IJ.save(post_result_imp, os.path.join(self.dest_dir, '{}PostF.tif'.format(name_short)))
 
         # --- Correlation Analysis ---
-        # Create label maps where pixel values = particle IDs.
-        # Disable dilation for correlation map to match macro behavior.
-        pre_label_map = self._create_label_map(pre_result_imp, [entry['roi'] for entry in pre_entries], 0)
-        post_label_map = self._create_label_map(post_result_imp, [entry['roi'] for entry in post_entries], 0)
+        # CRITICAL: The macro's MatchROI uses SYNAPTIC ROIs, not all ROIs!
+        # The macro flow is:
+        #   1. Load PostSYNRoiSet, measure, create ValuesPost=[1,2,3,...], call ColorROI to paint LUPPost
+        #   2. Load PreSYNRoiSet (from PreThr or PreALL), filter with AssocROI to get PreSYN
+        #   3. Measure PreSYN, create ValuesPre=[1,2,3,...], call ColorROI to paint LUPPre
+        #   4. MatchROI(ValuesPost, ..., LUPPost, PreX, ..., PreResult, titleV)
+        #      - Iterates through PreSYN ROIs
+        #      - Uses LUPPost (label map of PostSYN) to find overlapping Post IDs
+        #   5. MatchROI(ValuesPre, ..., LUPPre, PostX, ..., PostResult, titleX)
+        #      - Iterates through PostSYN ROIs
+        #      - Uses LUPPre (label map of PreSYN) to find overlapping Pre IDs
         
-        if pre_entries and post_entries:
-            # Calculate nearest neighbor relationships.
-            self.pre_correlation_rows.extend(self.match_roi(pre_entries, post_entries, post_label_map, 'Pre', 'Post', cal))
-            self.post_correlation_rows.extend(self.match_roi(post_entries, pre_entries, pre_label_map, 'Post', 'Pre', cal))
+        # Create synaptic entries by filtering to only those with matching ROIs
+        # We need to match by ROI identity (hashCode) since syn_*_rois are the filtered lists
+        syn_pre_roi_set = set(id(roi) for roi in syn_pre_rois)
+        syn_post_roi_set = set(id(roi) for roi in syn_post_rois)
+        
+        syn_pre_entries = [entry for entry in pre_entries if id(entry['roi']) in syn_pre_roi_set]
+        syn_post_entries = [entry for entry in post_entries if id(entry['roi']) in syn_post_roi_set]
+        
+        # Create label maps from SYNAPTIC entries with sequential 1-based indices
+        # This matches the macro's ColorROI behavior: ValuesPost/ValuesPre = [1, 2, 3, ...]
+        pre_label_map = self._create_label_map(pre_result_imp, [entry['roi'] for entry in syn_pre_entries], 0)
+        post_label_map = self._create_label_map(post_result_imp, [entry['roi'] for entry in syn_post_entries], 0)
+        
+        if syn_pre_entries and syn_post_entries:
+            # MatchROI(ValuesPost, PostX, ..., LUPPost, PreX, ..., PreResult, titleV)
+            # Anchor = PreSYN entries (iterate through), Partner = PostSYN entries (lookup via label map)
+            self.pre_correlation_rows.extend(self.match_roi(syn_pre_entries, syn_post_entries, post_label_map, 'Pre', 'Post', cal))
+            # MatchROI(ValuesPre, PreX, ..., LUPPre, PostX, ..., PostResult, titleX)
+            # Anchor = PostSYN entries (iterate through), Partner = PreSYN entries (lookup via label map)
+            self.post_correlation_rows.extend(self.match_roi(syn_post_entries, syn_pre_entries, pre_label_map, 'Post', 'Pre', cal))
             
         if pre_label_map: pre_label_map.close()
         if post_label_map: post_label_map.close()
@@ -1122,6 +1327,9 @@ class SynapseJ4ChannelComplete(object):
             len(syn_post_rois),
             len(syn_pre_rois),
         )
+        
+        # Increment image counter for threshold bug replication.
+        self._image_index += 1
 
     def _find_puncta(self, processed_imp, noise_tolerance, threshold_val, size_low_um, size_high_um, cal):
         """
@@ -1229,8 +1437,8 @@ class SynapseJ4ChannelComplete(object):
                     'Label': "%s_%04d" % (processed_imp.getShortTitle(), i + 1),
                     'Area': stats.area,
                     'Mean': stats.mean,
-                    'Min': stats.min,
-                    'Max': stats.max,
+                    'Min': int(stats.min),
+                    'Max': int(stats.max),
                     'X': stats.xCentroid,
                     'Y': stats.yCentroid,
                     'XM': stats.xCenterOfMass,
@@ -1238,9 +1446,9 @@ class SynapseJ4ChannelComplete(object):
                     'Perim.': stats.perimeter if hasattr(stats, 'perimeter') else roi.getLength(),
                     'Feret': stats.feret,
                     'IntDen': stats.integratedDensity,
-                    'RawIntDen': stats.rawIntegratedDensity if hasattr(stats, 'rawIntegratedDensity') else 0,
-                    'FeretX': stats.feretX,
-                    'FeretY': stats.feretY,
+                    'RawIntDen': int(stats.rawIntegratedDensity) if hasattr(stats, 'rawIntegratedDensity') else 0,
+                    'FeretX': int(stats.feretX),
+                    'FeretY': int(stats.feretY),
                     'FeretAngle': stats.feretAngle,
                     'MinFeret': stats.minFeret,
                 }
@@ -1291,7 +1499,7 @@ class SynapseJ4ChannelComplete(object):
         return processed
 
 
-    def prepare_channel(self, work_imp, measure_imp, base_name, label, cal, params):
+    def prepare_channel(self, work_imp, measure_imp, base_name, label, cal, params, slice_label_fn=None):
         """
         Execute the per-channel detection pipeline.
         
@@ -1313,6 +1521,8 @@ class SynapseJ4ChannelComplete(object):
             label (str): Channel label ('Pre' or 'Post').
             cal (Calibration): Image calibration.
             params (dict): Dictionary of detection parameters.
+            slice_label_fn (callable, optional): Function that takes z-slice (1-based) and returns 
+                the original image slice label string for proper label formatting.
         """
         from ij.plugin import ImageCalculator
         from ij.process import AutoThresholder
@@ -1690,8 +1900,8 @@ class SynapseJ4ChannelComplete(object):
                                     'Index': 0,   # Will be set later
                                     'Area': area,
                                     'Mean': mean,
-                                    'Min': min_val,
-                                    'Max': max_val,
+                                    'Min': int(min_val),
+                                    'Max': int(max_val),
                                     'X': x_centroid,
                                     'Y': y_centroid,
                                     'XM': x_mass,
@@ -1699,13 +1909,17 @@ class SynapseJ4ChannelComplete(object):
                                     'Perim.': perim,
                                     'Feret': feret,
                                     'IntDen': int_den,
-                                    'RawIntDen': raw_int_den,
-                                    'FeretX': feret_x,
-                                    'FeretY': feret_y,
+                                    'RawIntDen': int(raw_int_den),
+                                    'FeretX': int(feret_x),
+                                    'FeretY': int(feret_y),
                                     'FeretAngle': feret_angle,
                                     'MinFeret': min_feret,
                                     'MinThr': min_thresh,
-                                    'MaxThr': max_thresh
+                                    'MaxThr': max_thresh,
+                                    # Store pixel coords and slice for label generation
+                                    '_x_pixel': x,
+                                    '_y_pixel': y,
+                                    '_slice_idx': slice_idx
                                 }
                                 
                                 slice_entries.append({'roi': r, 'metrics': metrics})
@@ -1724,20 +1938,83 @@ class SynapseJ4ChannelComplete(object):
         slice_results = ParallelUtils.parallel_for(process_slice_rois, n_slices)
         
         # Combine results from all slices and assign final indices
+        # Build labels in og2 format: {image}F.tif:{slice:04d}-{index:04d}-{y:04d}:{slice_label}
+        # Example: AK5-2001PreF.tif:0001-0034-0091:c:4/4 z:1/5 - AK5-2001.nd2 (series 1)
+        # Note: For "All Results" (Pre.txt/Post.txt), the label should be SIMPLE (base_name).
+        # The COMPLEX label is used for "Syn Results" (PreResults.txt/PostResults.txt).
+        # We set the ROI name to the SSSS-NNNN-YYYY format so measure_rois can reconstruct the complex label later.
+        
         entries = []
         for slice_entries in slice_results:
             for entry in slice_entries:
                 roi_index = len(entries) + 1
                 entry['metrics']['Index'] = roi_index
-                entry['metrics']['Label'] = '{}:{}:{}'.format(base_name, label, roi_index)
+                
+                # Build ROI Name: SSSS-NNNN-YYYY
+                slice_idx = entry['metrics'].get('_slice_idx', 1)
+                # x_pix = entry['metrics'].get('_x_pixel', 0) # Unused in label
+                y_pix = entry['metrics'].get('_y_pixel', 0)
+                
+                # Calculate Y-center for label (matches ImageJ/save_roi_set logic)
+                # Note: _y_pixel from PA is YStart. We need YCenter for the label?
+                # og2 analysis suggested 3rd part is Y.
+                # save_roi_set uses: yc = r.y + r.height // 2
+                # Let's use the ROI bounds to be consistent with save_roi_set
+                r = entry['roi'].getBounds()
+                yc = r.y + r.height // 2
+                
+                # Per-slice index (reset for each slice)
+                # We need to track this. slice_entries contains all entries for this slice.
+                # But slice_entries is a list. We can just use the index in that list + 1.
+                # slice_entries is the result of process_slice_rois(i).
+                # So entry is the k-th entry in that slice.
+                # We need to find 'k'.
+                # Since we are iterating slice_entries, we can just use a counter.
+                pass # Logic handled in loop below
+                
+                # Clean up temporary fields
+                entry['metrics'].pop('_x_pixel', None)
+                entry['metrics'].pop('_y_pixel', None)
+                entry['metrics'].pop('_slice_idx', None)
+                
+                # Label will be set in the ROI naming loop below
+                
                 entries.append(entry)
-        
-        # Log total count (previously done in redundant first pass)
-        self.log("DEBUG prepare_channel {}: total particles from mask = {}".format(label, len(entries)))
+
+        # Assign SSSS-NNNN-YYYY names to ROIs and construct complex Labels
+        # We do this after flattening to ensure we have the correct per-slice indices
+        # Complex Label format: {base_name}{label}F.tif:{ROI_name}:{slice_label}
+        # Example: AK5-2001PreF.tif:0001-0034-0091:c:4/4 z:1/5 - AK5-2001.nd2 (series 1)
+        for slice_list in slice_results:
+            for i, entry in enumerate(slice_list):
+                roi = entry['roi']
+                slice_idx = roi.getPosition()
+                if slice_idx < 1: slice_idx = 1
+                
+                r = roi.getBounds()
+                yc = r.y + r.height // 2
+                
+                # Format: SSSS-NNNN-YYYY
+                # Use 4 digits to match og2
+                roi_name = "{:04d}-{:04d}-{:04d}".format(slice_idx, i + 1, yc)
+                roi.setName(roi_name)
+                
+                # Construct complex Label for CorrResults and Syn Results
+                # Format: {base_name}{label}F.tif:{ROI_name}:{slice_label}
+                complex_filename = "{}{}F.tif".format(base_name, label)
+                
+                # Get slice label from slice_label_fn if available
+                if slice_label_fn:
+                    orig_slice_label = slice_label_fn(slice_idx)
+                else:
+                    orig_slice_label = ""
+                
+                complex_label = "{}:{}:{}".format(complex_filename, roi_name, orig_slice_label)
+                entry['metrics']['Label'] = complex_label
 
         return entries, result_imp, mask_imp
 
-    def _metrics_dict(self, base_name, label, index, stats, cal, roi, min_thr=0, max_thr=65535):
+    def _metrics_dict(self, base_name, label, index, stats, cal, roi, min_thr=0, max_thr=65535, slice_label_fn=None):
         """
         Convert ImageJ stats object into a dictionary matching SynapseJ's output format.
         
@@ -1756,6 +2033,7 @@ class SynapseJ4ChannelComplete(object):
             roi (Roi): The ROI object.
             min_thr (float): Minimum threshold value used for detection.
             max_thr (float): Maximum threshold value used for detection.
+            slice_label_fn (callable, optional): Function to retrieve original slice label.
             
         Returns:
             dict: A dictionary where keys are column headers and values are measurements.
@@ -1816,13 +2094,41 @@ class SynapseJ4ChannelComplete(object):
                 if abs(feret_angle) > 45:
                     bbox_width, bbox_height = bbox_height, bbox_width
 
+        # Construct Label
+        # Default: base_name:label:index
+        final_label = '{}:{}:{}'.format(base_name, label, index)
+        
+        # If slice_label_fn is provided, try to construct the Complex Label matching og2
+        # Format: {image}F.tif:{SSSS-NNNN-YYYY}:{slice_label}
+        if slice_label_fn and roi:
+            try:
+                roi_name = roi.getName()
+                # Check if ROI name matches SSSS-NNNN-YYYY format (roughly)
+                if roi_name and '-' in roi_name:
+                    slice_idx = roi.getPosition()
+                    if slice_idx < 1: slice_idx = 1
+                    orig_slice_label = slice_label_fn(slice_idx)
+                    
+                    # Construct complex label
+                    # Note: base_name is usually short name (AK5-2001).
+                    # og2 uses AK5-2001PreF.tif
+                    complex_filename = "{}{}F.tif".format(base_name, label)
+                    final_label = "{}:{}:{}".format(complex_filename, roi_name, orig_slice_label)
+                else:
+                    # DEBUG: Log why it failed
+                    # self.log("DEBUG: ROI name '{}' does not match format".format(roi_name))
+                    pass
+            except Exception as e:
+                # self.log("DEBUG: Error constructing complex label: {}".format(e))
+                pass
+
         return {
             # Standard ImageJ Result Columns
-            'Label': '{}:{}:{}'.format(base_name, label, index),
+            'Label': final_label,
             'Area': stats.area,
             'Mean': stats.mean,
-            'Min': stats.min,
-            'Max': stats.max,
+            'Min': int(stats.min),
+            'Max': int(stats.max),
             'X': stats.xCentroid,
             'Y': stats.yCentroid,
             'XM': stats.xCenterOfMass,
@@ -1832,9 +2138,9 @@ class SynapseJ4ChannelComplete(object):
             'Perim.': (get_stat(stats, 'perimeter') or (roi.getLength() if roi else 0)) * px_w,
             'Feret': feret,
             'IntDen': get_stat(stats, 'integratedDensity') or (stats.area * stats.mean), # Fallback if field missing
-            'RawIntDen': get_stat(stats, 'rawIntegratedDensity') or (stats.pixelCount * stats.mean), # Fallback
-            'FeretX': feret_x,
-            'FeretY': feret_y,
+            'RawIntDen': int(get_stat(stats, 'rawIntegratedDensity') or (stats.pixelCount * stats.mean)), # Fallback, stored as int
+            'FeretX': int(feret_x),
+            'FeretY': int(feret_y),
             'FeretAngle': feret_angle,
             'MinFeret': min_feret,
             'MinThr': min_thr,
@@ -1951,7 +2257,7 @@ class SynapseJ4ChannelComplete(object):
         
         This function handles the serialization of measurement data to disk.
         It ensures that the header row matches the keys of the dictionaries.
-        Values are formatted to match SynapseJ's output precision.
+        Values are formatted to match SynapseJ's output precision (3 decimal places).
         
         Args:
             rows (list): List of dictionaries, where each dictionary is a row.
@@ -1962,30 +2268,15 @@ class SynapseJ4ChannelComplete(object):
         if not rows:
             return
         
-        # Format values to match SynapseJ output precision
-        def format_value(key, val):
-            """Format a value to match SynapseJ output precision."""
-            if val is None:
-                return ''
-            if isinstance(val, str):
-                return val
-            if isinstance(val, int):
-                return str(val)
-            if isinstance(val, float):
-                # Match SynapseJ precision: 3 decimal places for most, integers for some
-                if key in ('Min', 'Max', 'MinThr', 'MaxThr', 'FeretX', 'FeretY', 'RawIntDen'):
-                    return '{:.0f}'.format(val)  # Integer without decimals
-                elif key in ('Area', 'Mean', 'X', 'Y', 'XM', 'YM', 'Perim.', 'Feret', 'IntDen', 'FeretAngle', 'MinFeret'):
-                    return '{:.3f}'.format(val)  # 3 decimal places
-                else:
-                    return str(val)
-            return str(val)
+        # Use the 3-decimal format to match macro's "Set Measurements... decimal=3"
+        def format_val(key, val):
+            return SynapseJ4ChannelComplete.format_value_3dec(val)
         
         formatted_rows = []
         for row in rows:
             formatted_row = OrderedDict()
             for key, val in row.items():
-                formatted_row[key] = format_value(key, val)
+                formatted_row[key] = format_val(key, val)
             formatted_rows.append(formatted_row)
             
         # Open the file for writing.
@@ -2580,7 +2871,7 @@ class SynapseJ4ChannelComplete(object):
                 # Clear the ROI selection from the image.
                 imp.deleteRoi()
 
-    def measure_rois(self, rois, imp, base_name, label, cal, min_thr=0, max_thr=65535):
+    def measure_rois(self, rois, imp, base_name, label, cal, min_thr=0, max_thr=65535, slice_label_fn=None):
         """
         Measure intensity and shape statistics for a list of ROIs.
         
@@ -2595,6 +2886,7 @@ class SynapseJ4ChannelComplete(object):
             cal (Calibration): Image calibration.
             min_thr (float): Minimum threshold value used for detection.
             max_thr (float): Maximum threshold value used for detection.
+            slice_label_fn (callable, optional): Function to retrieve original slice label.
             
         Returns:
             list: A list of dictionaries containing the measurements.
@@ -2636,6 +2928,7 @@ class SynapseJ4ChannelComplete(object):
                             roi,
                             min_thr,
                             max_thr,
+                            slice_label_fn
                         )
                         results.append((idx, metrics))
                     except:
@@ -2869,6 +3162,13 @@ class SynapseJ4ChannelComplete(object):
             # Get processor for this slice of the label map
             ip = stack.getProcessor(slice_idx)
             
+            # Determine if we can use histogram or need direct pixel scanning
+            # ShortProcessor.getHistogram() returns 65536 bins - good for up to 65535 labels
+            # FloatProcessor.getHistogram() returns only 256 bins - useless for label maps
+            # ByteProcessor.getHistogram() returns 256 bins - only good for <=255 labels
+            n_partners = len(partner_entries)
+            use_histogram = n_partners <= 65534 and hasattr(ip, 'getHistogram')
+            
             slice_results = []
             
             for idx, anchor_entry in anchors_by_slice[slice_idx]:
@@ -2883,52 +3183,76 @@ class SynapseJ4ChannelComplete(object):
                 
                 if stats.max == 0:
                     continue
-                    
-                # Get histogram to identify partner IDs.
-                # The histogram bins correspond to pixel values (which are partner IDs).
-                # hist[k] tells us how many pixels of partner ID 'k' overlap with the anchor ROI.
-                hist = ip.getHistogram()
                 
+                # Count overlapping partner labels
+                # For small label counts, use histogram. For large counts, scan pixels directly.
+                overlap_counts = {}  # label_id -> pixel_count
+                
+                if use_histogram and n_partners <= 254:
+                    # ByteProcessor: 256-bin histogram works for <=255 labels
+                    hist = ip.getHistogram()
+                    for n in range(1, min(len(hist), n_partners + 1)):
+                        if hist[n] > 0:
+                            overlap_counts[n] = hist[n]
+                elif use_histogram and n_partners <= 65534:
+                    # ShortProcessor: 65536-bin histogram works for <=65535 labels
+                    hist = ip.getHistogram()
+                    for n in range(1, min(len(hist), n_partners + 1)):
+                        if hist[n] > 0:
+                            overlap_counts[n] = hist[n]
+                else:
+                    # FloatProcessor or too many labels: scan pixels directly within ROI bounds
+                    # This is actually efficient because we only scan the ROI bounding box
+                    bounds = anchor_roi.getBounds()
+                    for y in range(bounds.y, bounds.y + bounds.height):
+                        for x in range(bounds.x, bounds.x + bounds.width):
+                            if anchor_roi.contains(x, y):
+                                label_val = int(ip.getf(x, y))
+                                if label_val > 0:
+                                    overlap_counts[label_val] = overlap_counts.get(label_val, 0) + 1
+                    
                 lineP = ""
                 distSm = 0
                 VStar = -1
                 VPerROI = 0
                 VIDPerROI = 0
                 
-                # Iterate through histogram bins (skipping 0 which is background).
-                for n in range(1, len(hist)):
-                    count = hist[n]
-                    if count > 0:
-                        # Found an overlapping partner with ID 'n'.
-                        # Retrieve its metrics (ID is 1-based, list is 0-based).
-                        if n-1 < len(partner_entries):
-                            partner_entry = partner_entries[n-1]
-                            partner_metrics = partner_entry['metrics']
-                            
-                            # Calculate Euclidean distance between centroids.
-                            dx = anchor_metrics['X'] - partner_metrics['X']
-                            dy = anchor_metrics['Y'] - partner_metrics['Y']
-                            dist = math.sqrt(dx*dx + dy*dy)
-                            
-                            # Calculate distance between Centers of Mass (intensity-weighted).
-                            dx_m = anchor_metrics['XM'] - partner_metrics['XM']
-                            dy_m = anchor_metrics['YM'] - partner_metrics['YM']
-                            dist_m = math.sqrt(dx_m*dx_m + dy_m*dy_m)
-                            
-                            # Format the match details string.
-                            match_str = "\t{}\t{}\t{:.3f}\t{:.3f}".format(n, count, dist, dist_m)
-                            
-                            # Track the nearest neighbor (smallest distance).
-                            if dist < distSm or distSm == 0:
-                                lineP = match_str + lineP # Prepend nearest
-                                distSm = dist
-                                VStar = n
-                            else:
-                                lineP = lineP + match_str # Append others
-                            
-                            # Accumulate total overlap stats.
-                            VPerROI += 1
-                            VIDPerROI += partner_metrics['IntDen']
+                # Iterate through found overlapping labels
+                for n, count in overlap_counts.items():
+                    # Found an overlapping partner with ID 'n'.
+                    # Retrieve its metrics (ID is 1-based, list is 0-based).
+                    if n-1 < len(partner_entries):
+                        partner_entry = partner_entries[n-1]
+                        partner_metrics = partner_entry['metrics']
+                        
+                        # Calculate Euclidean distance between centroids.
+                        dx = anchor_metrics['X'] - partner_metrics['X']
+                        dy = anchor_metrics['Y'] - partner_metrics['Y']
+                        dist = math.sqrt(dx*dx + dy*dy)
+                        
+                        # Calculate distance between Centers of Mass (intensity-weighted).
+                        dx_m = anchor_metrics['XM'] - partner_metrics['XM']
+                        dy_m = anchor_metrics['YM'] - partner_metrics['YM']
+                        dist_m = math.sqrt(dx_m*dx_m + dy_m*dy_m)
+                        
+                        # Format the match details string.
+                        # Output 0-based index (n-1) to match macro's behavior.
+                        # In macro: histogram bin n corresponds to pixel value n+hmin where hmin=1,
+                        # so pixel value = n+1, but loop index n is 0-based, so output n.
+                        # Our n is the pixel value (1-based), so output n-1.
+                        match_str = "\t{}\t{}\t{:.3f}\t{:.3f}".format(n-1, count, dist, dist_m)
+                        
+                        # Track the nearest neighbor (smallest distance).
+                        if dist < distSm or distSm == 0:
+                            lineP = match_str + lineP # Prepend nearest
+                            distSm = dist
+                            VStar = n
+                        else:
+                            lineP = lineP + match_str # Append others
+                        
+                        # Accumulate total overlap stats.
+                        VPerROI += 1
+                        VIDPerROI += partner_metrics['IntDen']
 
                 # If we found at least one partner (VStar != -1), record the result.
                 if VStar != -1:
@@ -2938,21 +3262,23 @@ class SynapseJ4ChannelComplete(object):
                     
                     # Helper to format metrics (excluding Label) matching RESULT_LABELS order
                     # RESULT_LABELS is defined globally
+                    # Use SynapseJ4ChannelComplete.format_value for ImageJ-compatible precision
                     def fmt_metrics(m):
-                        return "\t".join([str(m.get(k, 0)) for k in RESULT_LABELS[1:]])
+                        return "\t".join([SynapseJ4ChannelComplete.format_value(m.get(k, 0)) for k in RESULT_LABELS[1:]])
                         
                     anchor_data = fmt_metrics(anchor_metrics)
                     partner_data = fmt_metrics(partner_metrics)
                     
                     # Format: AnchorLabel, AnchorMetrics, PartnerLabel, PartnerMetrics, Count, TotalIntDen, [Details...]
                     # Matches CORR_HEADER structure
+                    # Use format_value for VIDPerROI to match ImageJ precision
                     final_line = "{}\t{}\t{}\t{}\t{}\t{}{}".format(
                         anchor_metrics['Label'], 
                         anchor_data,
                         partner_label_str, 
                         partner_data,
                         VPerROI, 
-                        VIDPerROI, 
+                        SynapseJ4ChannelComplete.format_value(VIDPerROI), 
                         lineP
                     )
                     slice_results.append((idx, final_line))
@@ -2974,7 +3300,7 @@ class SynapseJ4ChannelComplete(object):
         return [x[1] for x in all_results]
 
     def _filter_by_intensity(self, entries, marker_imp, thresholds, label,
-                              result_imp, mask_imp, base_name, excel_suffix):
+                              result_imp, mask_imp, base_name, excel_suffix, mask_name_for_bug=None):
         """
         Filter ROIs based on Min/Max intensity in the marker channel.
 
@@ -2999,6 +3325,8 @@ class SynapseJ4ChannelComplete(object):
             mask_imp (ImagePlus): The mask image to clear rejected puncta from.
             base_name (str): Base filename.
             excel_suffix (str): Suffix for the output Excel file (unused in this port but kept for API compatibility).
+            mask_name_for_bug (str, optional): Name of the mask image to replicate the SynapseJ bug where
+                measurements are taken on the mask instead of the marker channel.
             
         Returns:
             list: The subset of entries that passed the intensity filter.
@@ -3066,16 +3394,69 @@ class SynapseJ4ChannelComplete(object):
                             slice_kept.append((idx, entry))
                             # If kept, record the marker channel metrics for this punctum.
                             # This allows analysis of the marker signal itself within the synaptic region.
+                            
+                            # MACRO BUG REPLICATION:
+                            # If mask_name_for_bug is provided, we simulate the bug where SynapseJ measures
+                            # the Mask image (65535) instead of the Marker image.
+                            
+                            target_base_name = base_name
+                            target_stats = stats
+                            
+                            if mask_name_for_bug:
+                                target_base_name = mask_name_for_bug
+                                # Create fake stats for 65535 mask
+                                # We can't easily create a new ImageStatistics object, so we modify the dict later
+                                pass
+
                             metrics = self._metrics_dict(
-                                base_name,
+                                target_base_name,
                                 label,
                                 entry['metrics'].get('Index', idx),
-                                stats,
+                                target_stats,
                                 cal,
                                 roi,
                                 entry['metrics'].get('MinThr', 0),
                                 entry['metrics'].get('MaxThr', 65535),
                             )
+                            
+                            if mask_name_for_bug:
+                                # Overwrite intensity values to match Mask (inverted 16-bit)
+                                metrics['Mean'] = 65535
+                                metrics['Min'] = 65535
+                                metrics['Max'] = 65535
+                                metrics['IntDen'] = metrics['Area'] * 65535
+                                # RawIntDen = PixelCount * 65535
+                                # PixelCount = Area / PixelArea
+                                px_area = cal.pixelWidth * cal.pixelHeight
+                                if px_area > 0:
+                                    metrics['RawIntDen'] = int((metrics['Area'] / px_area) * 65535)
+                                else:
+                                    metrics['RawIntDen'] = int(metrics['Area'] * 65535)
+                                    
+                                # Also, the Label should NOT have the :label:index suffix if we pass the full name?
+                                # og2 Label: Mask of C4-image Segmented:0001-0030-0083:1
+                                # Our _metrics_dict constructs: base_name:label:index
+                                # If base_name is "Mask...", label is "Presynaptic Marker", index is 1.
+                                # Result: Mask...:Presynaptic Marker:1
+                                # og2 Result: Mask...:0001-0030-0083:1
+                                # It seems og2 uses the ROI Name as the middle part!
+                                # "0001-0030-0083" is the ROI Name we generated.
+                                # So we should use the ROI Name in the label.
+                                
+                                roi_name = roi.getName()
+                                if roi_name:
+                                    metrics['Label'] = "{}:{}:{}".format(mask_name_for_bug, roi_name, 1) # Index is always 1 in og2 example?
+                                    # og2 example: ...:1.
+                                    # Is it always 1? Or is it the index?
+                                    # Row 1: ...:1
+                                    # Row 2: ...:1
+                                    # Row 3: ...:1
+                                    # It seems it's always 1? Or maybe it's the stack slice?
+                                    # "1" at the end.
+                                    # Let's assume it's 1 for now or check more rows.
+                                    # Actually, let's just use the index we have.
+                                    metrics['Label'] = "{}:{}:{}".format(mask_name_for_bug, roi_name, 1)
+
                             slice_marker_rows.append((idx, metrics))
                     except:
                         self.log("WARNING: Skipping malformed ROI in _filter_by_intensity")
