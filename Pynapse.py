@@ -3813,8 +3813,13 @@ class SynapseJ4ChannelComplete(object):
         """
         Generate presentation output: Batch_Synapse_Report.csv (accumulated).
         
-        Creates Complete synapse rows linking Pre and Post IDs with geometry measurements.
-        Only accumulates to batch_synapse_rows which is saved at end of run.
+        Creates Complete synapse rows linking Pre and Post IDs with comprehensive 
+        geometry measurements for both intersection (overlap region) and union 
+        (combined extent) of synaptic puncta pairs.
+        
+        This implements object-based colocalization analysis as described in ImageJ 
+        documentation, measuring the intersection (AND) and union (OR) of Pre and 
+        Post ROIs to characterize synapse morphology.
         
         Args:
             base_name (str): Image name.
@@ -3896,6 +3901,10 @@ class SynapseJ4ChannelComplete(object):
                     pre_id = pre_entry['metrics']['Label']
                     post_id = post_entry['metrics']['Label']
                     
+                    # Extract pre and post metrics for intensity info and geometry
+                    pre_m = pre_entry['metrics']
+                    post_m = post_entry['metrics']
+                    
                     # --- Geometry Calculations ---
                     # Use pixel-based method exclusively for intersection (consistent with overlap_px)
                     pixel_area = cal.pixelWidth * cal.pixelHeight
@@ -3903,7 +3912,7 @@ class SynapseJ4ChannelComplete(object):
                     # Intersection area = overlap pixels * pixel area (matches Overlap um^2 exactly)
                     intersect_area = overlap_px * pixel_area
                     
-                    # Get bounding boxes for overlap iteration
+                    # Get bounding boxes for geometry calculations
                     pre_bounds = pre_roi.getBounds()
                     post_bounds = post_roi.getBounds()
                     
@@ -3913,81 +3922,165 @@ class SynapseJ4ChannelComplete(object):
                     ix2 = min(pre_bounds.x + pre_bounds.width, post_bounds.x + post_bounds.width)
                     iy2 = min(pre_bounds.y + pre_bounds.height, post_bounds.y + post_bounds.height)
                     
-                    # OPTIMIZED: Use geometry from overlap_px instead of pixel iteration
-                    # The overlap_px is already accurate from the label map histogram
-                    # We approximate geometry using the bounding box intersection
+                    # --- Create actual Intersection ROI using ShapeRoi ---
+                    # This provides accurate geometric measurements instead of approximations
+                    # Note: 'and' is a Python keyword, so we use getattr() to call the Java method
+                    try:
+                        pre_shape = ShapeRoi(pre_roi)
+                        post_shape = ShapeRoi(post_roi)
+                        # ShapeRoi.and(ShapeRoi) returns the intersection
+                        intersect_roi = getattr(pre_shape, 'and')(post_shape)
+                        
+                        if intersect_roi is not None and intersect_roi.getBounds().width > 0:
+                            # Set up the ROI with proper image and calibration for accurate measurements
+                            intersect_roi.setImage(pre_result_imp)
+                            intersect_roi.setPosition(slice_idx)
+                            
+                            # Get intersection statistics from the actual ROI
+                            pre_measure_ip.setRoi(intersect_roi)
+                            intersect_stats = ImageStatistics.getStatistics(
+                                pre_measure_ip, 
+                                Measurements.AREA | Measurements.MEAN | Measurements.CENTROID | Measurements.INTEGRATED_DENSITY,
+                                cal
+                            )
+                            
+                            intersect_area = intersect_stats.area
+                            intersect_x = intersect_stats.xCentroid
+                            intersect_y = intersect_stats.yCentroid
+                            intersect_intden = intersect_stats.mean * intersect_stats.area / pixel_area
+                            intersect_rawintden = intersect_intden
+                            
+                            # Get perimeter from ROI (returns calibrated value when image is set)
+                            intersect_perim = intersect_roi.getLength() if intersect_roi else 0
+                            
+                            # Get Feret values from ROI
+                            try:
+                                feret_vals = intersect_roi.getFeretValues()
+                                intersect_feret = feret_vals[0] if feret_vals else 0
+                                intersect_min_feret = feret_vals[2] if feret_vals else 0
+                            except:
+                                # Fallback: estimate from area as circular diameter
+                                intersect_feret = 2 * math.sqrt(intersect_area / math.pi) if intersect_area > 0 else 0
+                                intersect_min_feret = intersect_feret
+                            
+                            # Calculate intersection circularity: 4*pi*area/perimeter^2
+                            if intersect_perim > 0:
+                                intersect_circ = 4.0 * math.pi * intersect_area / (intersect_perim * intersect_perim)
+                            else:
+                                intersect_circ = 1.0  # Perfect circle default
+                        else:
+                            raise Exception("Empty intersection")
+                    except:
+                        # Fallback to approximation if ShapeRoi fails
+                        intersect_x = (pre_m.get('X', 0) + post_m.get('X', 0)) / 2.0
+                        intersect_y = (pre_m.get('Y', 0) + post_m.get('Y', 0)) / 2.0
+                        pre_mean = pre_m.get('Mean', 0)
+                        intersect_rawintden = pre_mean * overlap_px
+                        intersect_intden = intersect_rawintden
+                        
+                        if ix2 > ix1 and iy2 > iy1:
+                            overlap_width = (ix2 - ix1) * cal.pixelWidth
+                            overlap_height = (iy2 - iy1) * cal.pixelHeight
+                            intersect_feret = max(overlap_width, overlap_height)
+                            intersect_min_feret = min(overlap_width, overlap_height)
+                            intersect_perim = 2 * (overlap_width + overlap_height)
+                        else:
+                            equiv_radius = math.sqrt(intersect_area / math.pi) if intersect_area > 0 else 0
+                            intersect_perim = 2 * math.pi * equiv_radius
+                            intersect_feret = 2 * equiv_radius
+                            intersect_min_feret = 2 * equiv_radius
+                        
+                        # Approximate circularity
+                        if intersect_perim > 0:
+                            intersect_circ = 4.0 * math.pi * intersect_area / (intersect_perim * intersect_perim)
+                        else:
+                            intersect_circ = 1.0
                     
-                    pre_m = pre_entry['metrics']
-                    post_m = post_entry['metrics']
-                    
-                    # Intersection centroid: weighted average of Pre and Post centroids by overlap
-                    # Since overlap exists, approximate as midpoint between centroids
-                    intersect_x = (pre_m.get('X', 0) + post_m.get('X', 0)) / 2.0
-                    intersect_y = (pre_m.get('Y', 0) + post_m.get('Y', 0)) / 2.0
-                    
-                    # Intersection IntDen: estimate from Pre signal in overlap region
-                    # Use Pre Mean * overlap_area as approximation (faster than pixel iteration)
-                    pre_mean = pre_m.get('Mean', 0)
-                    intersect_rawintden = pre_mean * overlap_px  # Raw = Mean * pixel count
-                    intersect_intden = intersect_rawintden
-                    
-                    # Geometry from bounding box intersection
-                    if ix2 > ix1 and iy2 > iy1:
-                        overlap_width = (ix2 - ix1) * cal.pixelWidth
-                        overlap_height = (iy2 - iy1) * cal.pixelHeight
-                        intersect_feret = max(overlap_width, overlap_height)
-                        intersect_min_feret = min(overlap_width, overlap_height)
-                        intersect_perim = 2 * (overlap_width + overlap_height)
-                    else:
-                        # Fallback to circular estimate from area
-                        equiv_radius = math.sqrt(intersect_area / math.pi) if intersect_area > 0 else 0
-                        intersect_perim = 2 * math.pi * equiv_radius
-                        intersect_feret = 2 * equiv_radius
-                        intersect_min_feret = 2 * equiv_radius
-                    
-                    # Union geometry calculated from Pre + Post - Intersection
-                    # Mathematical identity: Union Area = Pre Area + Post Area - Intersection Area
-                    pre_m = pre_entry['metrics']
-                    post_m = post_entry['metrics']
-                    
-                    # Get individual ROI metrics (geometry only)
-                    pre_area = pre_m.get('Area', 0)
-                    post_area = post_m.get('Area', 0)
-                    
-                    # Union Area = Pre + Post - Intersection (mathematically correct for geometry)
-                    union_area = pre_area + post_area - intersect_area
-                    
-                    # Union IntDen: Sum of Pre and Post IntDen values
-                    # Note: Pre and Post IntDen are measured on different channels, so this is
-                    # a combined signal measure, not a single-channel measurement like intersection.
-                    # For single-channel union IntDen, use the intersection IntDen formula approach.
-                    pre_intden = pre_m.get('IntDen', 0)
-                    post_intden = post_m.get('IntDen', 0)
-                    union_intden = pre_intden + post_intden
-                    union_rawintden = union_intden
-                    
-                    # Union centroid: weighted average by area
-                    if union_area > 0:
-                        # Weight each centroid by its contribution to union
-                        # Approximation: use area-weighted average of pre and post centroids
-                        pre_weight = pre_area / union_area
-                        post_weight = post_area / union_area
-                        union_x = pre_m.get('X', 0) * pre_weight + post_m.get('X', 0) * post_weight
-                        union_y = pre_m.get('Y', 0) * pre_weight + post_m.get('Y', 0) * post_weight
-                    else:
-                        union_x = (pre_m.get('X', 0) + post_m.get('X', 0)) / 2.0
-                        union_y = (pre_m.get('Y', 0) + post_m.get('Y', 0)) / 2.0
-                    
-                    # Union Feret: use the combined bounding box extent
-                    union_bbox_width = (max(pre_bounds.x + pre_bounds.width, post_bounds.x + post_bounds.width) - 
-                                       min(pre_bounds.x, post_bounds.x)) * cal.pixelWidth
-                    union_bbox_height = (max(pre_bounds.y + pre_bounds.height, post_bounds.y + post_bounds.height) - 
-                                        min(pre_bounds.y, post_bounds.y)) * cal.pixelHeight
-                    union_feret = max(union_bbox_width, union_bbox_height)
-                    union_min_feret = min(union_bbox_width, union_bbox_height)
-                    union_perim = 2 * (union_bbox_width + union_bbox_height)
+                    # --- Create actual Union ROI using ShapeRoi ---
+                    # Note: 'or' is a Python keyword, so we use getattr() to call the Java method
+                    try:
+                        pre_shape = ShapeRoi(pre_roi)
+                        post_shape = ShapeRoi(post_roi)
+                        # ShapeRoi.or(ShapeRoi) returns the union
+                        union_roi = getattr(pre_shape, 'or')(post_shape)
+                        
+                        if union_roi is not None and union_roi.getBounds().width > 0:
+                            # Set up the ROI with proper image and calibration for accurate measurements
+                            union_roi.setImage(pre_result_imp)
+                            union_roi.setPosition(slice_idx)
+                            
+                            # Get union statistics - use pre_measure_ip for consistency
+                            pre_measure_ip.setRoi(union_roi)
+                            union_stats = ImageStatistics.getStatistics(
+                                pre_measure_ip,
+                                Measurements.AREA | Measurements.MEAN | Measurements.CENTROID | Measurements.INTEGRATED_DENSITY,
+                                cal
+                            )
+                            
+                            union_area = union_stats.area
+                            union_x = union_stats.xCentroid
+                            union_y = union_stats.yCentroid
+                            
+                            # Get perimeter from ROI (returns calibrated value when image is set)
+                            union_perim = union_roi.getLength() if union_roi else 0
+                            
+                            # Get Feret values from ROI
+                            try:
+                                feret_vals = union_roi.getFeretValues()
+                                union_feret = feret_vals[0] if feret_vals else 0
+                                union_min_feret = feret_vals[2] if feret_vals else 0
+                            except:
+                                # Fallback: estimate from area as circular diameter
+                                union_feret = 2 * math.sqrt(union_area / math.pi) if union_area > 0 else 0
+                                union_min_feret = union_feret
+                            
+                            # Union IntDen: Sum of Pre and Post IntDen (from original channels)
+                            pre_intden_val = pre_m.get('IntDen', 0)
+                            post_intden_val = post_m.get('IntDen', 0)
+                            union_intden = pre_intden_val + post_intden_val
+                            union_rawintden = union_intden
+                            
+                            # Calculate union circularity
+                            if union_perim > 0:
+                                union_circ = 4.0 * math.pi * union_area / (union_perim * union_perim)
+                            else:
+                                union_circ = 1.0
+                        else:
+                            raise Exception("Empty union")
+                    except:
+                        # Fallback to mathematical approximation
+                        pre_area = pre_m.get('Area', 0)
+                        post_area = post_m.get('Area', 0)
+                        union_area = pre_area + post_area - intersect_area
+                        
+                        pre_intden_val = pre_m.get('IntDen', 0)
+                        post_intden_val = post_m.get('IntDen', 0)
+                        union_intden = pre_intden_val + post_intden_val
+                        union_rawintden = union_intden
+                        
+                        if union_area > 0:
+                            pre_weight = pre_area / union_area
+                            post_weight = post_area / union_area
+                            union_x = pre_m.get('X', 0) * pre_weight + post_m.get('X', 0) * post_weight
+                            union_y = pre_m.get('Y', 0) * pre_weight + post_m.get('Y', 0) * post_weight
+                        else:
+                            union_x = (pre_m.get('X', 0) + post_m.get('X', 0)) / 2.0
+                            union_y = (pre_m.get('Y', 0) + post_m.get('Y', 0)) / 2.0
+                        
+                        union_bbox_width = (max(pre_bounds.x + pre_bounds.width, post_bounds.x + post_bounds.width) - 
+                                           min(pre_bounds.x, post_bounds.x)) * cal.pixelWidth
+                        union_bbox_height = (max(pre_bounds.y + pre_bounds.height, post_bounds.y + post_bounds.height) - 
+                                            min(pre_bounds.y, post_bounds.y)) * cal.pixelHeight
+                        union_feret = max(union_bbox_width, union_bbox_height)
+                        union_min_feret = min(union_bbox_width, union_bbox_height)
+                        union_perim = 2 * (union_bbox_width + union_bbox_height)
+                        
+                        if union_perim > 0:
+                            union_circ = 4.0 * math.pi * union_area / (union_perim * union_perim)
+                        else:
+                            union_circ = 1.0
 
-                    # Distances
+                    # --- Distances between centroids ---
                     geo_dist = math.sqrt((pre_m['X'] - post_m['X'])**2 + (pre_m['Y'] - post_m['Y'])**2)
                     int_dist = math.sqrt((pre_m['XM'] - post_m['XM'])**2 + (pre_m['YM'] - post_m['YM'])**2)
 
@@ -3995,6 +4088,19 @@ class SynapseJ4ChannelComplete(object):
                         'pre_id': pre_id,
                         'post_id': post_id,
                         'overlap_px': overlap_px,
+                        # Pre intensity metrics (from CorrResults format)
+                        'pre_area': pre_m.get('Area', 0),
+                        'pre_mean': pre_m.get('Mean', 0),
+                        'pre_min': pre_m.get('Min', 0),
+                        'pre_max': pre_m.get('Max', 0),
+                        'pre_intden': pre_m.get('IntDen', 0),
+                        # Post intensity metrics (from CorrResults format)
+                        'post_area': post_m.get('Area', 0),
+                        'post_mean': post_m.get('Mean', 0),
+                        'post_min': post_m.get('Min', 0),
+                        'post_max': post_m.get('Max', 0),
+                        'post_intden': post_m.get('IntDen', 0),
+                        # Intersection geometry
                         'intersect_area': intersect_area,
                         'intersect_perim': intersect_perim,
                         'intersect_x': intersect_x,
@@ -4003,6 +4109,8 @@ class SynapseJ4ChannelComplete(object):
                         'intersect_min_feret': intersect_min_feret,
                         'intersect_intden': intersect_intden,
                         'intersect_rawintden': intersect_rawintden,
+                        'intersect_circ': intersect_circ,
+                        # Union geometry
                         'union_area': union_area,
                         'union_perim': union_perim,
                         'union_x': union_x,
@@ -4011,9 +4119,14 @@ class SynapseJ4ChannelComplete(object):
                         'union_min_feret': union_min_feret,
                         'union_intden': union_intden,
                         'union_rawintden': union_rawintden,
+                        'union_circ': union_circ,
+                        # Distances
                         'geo_dist': geo_dist,
                         'int_dist': int_dist
                     })
+            
+            # Reset ROI on processor
+            pre_measure_ip.resetRoi()
             return slice_matches
 
         # Run slice processing in parallel
@@ -4034,35 +4147,53 @@ class SynapseJ4ChannelComplete(object):
                 
                 overlap_px = match['overlap_px']
                 
-                # Synapse row - columns renamed (Pre ID, Post ID) and no BBox
+                # Synapse row - Enhanced with intensity metrics and circularity
+                # Format values using same precision as CorrResults for consistency
+                fmt = SynapseJ4ChannelComplete.format_value  # Use ImageJ-compatible formatting
                 row = OrderedDict([
                     ('Image Name', base_name),
                     ('Puncta ID', complete_id),
                     ('Included Channels', 'C1,C2,C3,C4'),
                     ('Type', 'Complete'),
                     ('Overlap (px)', overlap_px),
-                    ('Overlap (um^2)', overlap_px * self._pixel_area(cal)),
+                    ('Overlap (um^2)', fmt(overlap_px * self._pixel_area(cal))),
                     ('Pre ID', match['pre_id']),
                     ('Post ID', match['post_id']),
-                    # Synapse Geometry (no BBox)
-                    ('Intersect Area (um^2)', match['intersect_area']),
-                    ('Intersect Perim (um)', match['intersect_perim']),
-                    ('Intersect Centroid X (um)', match['intersect_x']),
-                    ('Intersect Centroid Y (um)', match['intersect_y']),
-                    ('Intersect Feret (um)', match['intersect_feret']),
-                    ('Intersect Min Feret (um)', match['intersect_min_feret']),
-                    ('Intersect IntDen', match['intersect_intden']),
-                    ('Intersect RawIntDen', match['intersect_rawintden']),
-                    ('Union Area (um^2)', match['union_area']),
-                    ('Union Perim (um)', match['union_perim']),
-                    ('Union Centroid X (um)', match['union_x']),
-                    ('Union Centroid Y (um)', match['union_y']),
-                    ('Union Feret (um)', match['union_feret']),
-                    ('Union Min Feret (um)', match['union_min_feret']),
-                    ('Union IntDen', match['union_intden']),
-                    ('Union RawIntDen', match['union_rawintden']),
-                    ('Geo Distance (um)', match['geo_dist']),
-                    ('Int Distance (um)', match['int_dist'])
+                    # Pre-synaptic puncta intensity metrics (from CorrResults format)
+                    ('Pre Area (um^2)', fmt(match['pre_area'])),
+                    ('Pre Mean Intensity', fmt(match['pre_mean'])),
+                    ('Pre Min Intensity', match['pre_min']),
+                    ('Pre Max Intensity', match['pre_max']),
+                    ('Pre IntDen', fmt(match['pre_intden'])),
+                    # Post-synaptic puncta intensity metrics (from CorrResults format)
+                    ('Post Area (um^2)', fmt(match['post_area'])),
+                    ('Post Mean Intensity', fmt(match['post_mean'])),
+                    ('Post Min Intensity', match['post_min']),
+                    ('Post Max Intensity', match['post_max']),
+                    ('Post IntDen', fmt(match['post_intden'])),
+                    # Intersection (overlap region) geometry
+                    ('Intersect Area (um^2)', fmt(match['intersect_area'])),
+                    ('Intersect Perim (um)', fmt(match['intersect_perim'])),
+                    ('Intersect Centroid X (um)', fmt(match['intersect_x'])),
+                    ('Intersect Centroid Y (um)', fmt(match['intersect_y'])),
+                    ('Intersect Feret (um)', fmt(match['intersect_feret'])),
+                    ('Intersect Min Feret (um)', fmt(match['intersect_min_feret'])),
+                    ('Intersect IntDen', fmt(match['intersect_intden'])),
+                    ('Intersect RawIntDen', fmt(match['intersect_rawintden'])),
+                    ('Intersect Circularity', fmt(match['intersect_circ'])),
+                    # Union (combined extent) geometry
+                    ('Union Area (um^2)', fmt(match['union_area'])),
+                    ('Union Perim (um)', fmt(match['union_perim'])),
+                    ('Union Centroid X (um)', fmt(match['union_x'])),
+                    ('Union Centroid Y (um)', fmt(match['union_y'])),
+                    ('Union Feret (um)', fmt(match['union_feret'])),
+                    ('Union Min Feret (um)', fmt(match['union_min_feret'])),
+                    ('Union IntDen', fmt(match['union_intden'])),
+                    ('Union RawIntDen', fmt(match['union_rawintden'])),
+                    ('Union Circularity', fmt(match['union_circ'])),
+                    # Distances between Pre and Post puncta
+                    ('Pre-Post Centroid Distance (um)', fmt(match['geo_dist'])),
+                    ('Pre-Post Center of Mass Distance (um)', fmt(match['int_dist']))
                 ])
                 synapse_rows.append(row)
         
