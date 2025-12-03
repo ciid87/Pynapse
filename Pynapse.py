@@ -942,11 +942,32 @@ class SynapseJ4ChannelComplete(object):
         self.excel_dir = os.path.join(self.dest_dir, 'excel')
         
         # Create output directories if they don't exist.
+        # Use Java File API as fallback since os.makedirs can silently fail in some Jython environments
         for folder in [self.dest_dir, self.merge_dir, self.excel_dir]:
             if not os.path.exists(folder):
-                os.makedirs(folder)
+                self.log('Creating directory: {}'.format(folder))
+                try:
+                    os.makedirs(folder)
+                except Exception as e:
+                    self.log('os.makedirs failed ({}), trying Java File API...'.format(e))
+                    try:
+                        from java.io import File
+                        jfile = File(folder)
+                        if not jfile.mkdirs():
+                            self.log('WARNING: Failed to create directory: {}'.format(folder))
+                    except Exception as e2:
+                        self.log('ERROR: Could not create directory {}: {}'.format(folder, e2))
+                        
+                # Verify directory was created
+                if not os.path.exists(folder):
+                    self.log('ERROR: Directory does not exist after creation attempt: {}'.format(folder))
+                    print('ERROR: Could not create output directory: {}'.format(folder))
+                    return
+                else:
+                    self.log('Directory verified: {}'.format(folder))
                 
         # Log the full configuration parameters to the console and log file.
+        self.log_configuration_summary()
         self.log_configuration_summary()
         
         image_files = []
