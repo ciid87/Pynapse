@@ -1124,22 +1124,26 @@ class SynapseJ4ChannelComplete(object):
         # The marker channel is processed with median blur (no background subtraction) and thresholded.
         
         if self.pre_marker_channel > 0 and self.pre_marker_thresholds:
-            # Duplicate the marker channel for processing.
-            marker_imp = channels[self.pre_marker_channel - 1].duplicate()
+            # Apply Median blur IN-PLACE to the marker channel, matching macro behavior.
+            # The macro does: selectWindow(LUPThr); run("Median...", "radius="+PreBlurPx+" stack");
+            # This modifies C2-image in-place, which is then used both for marker gating AND the merge.
+            marker_imp = channels[self.pre_marker_channel - 1]  # Direct reference, not duplicate
             
             # DEBUG: Check marker channel stats BEFORE blur
             from ij.process import ImageStatistics
             pre_blur_stats = ImageStatistics.getStatistics(marker_imp.getProcessor(), ImageStatistics.MEAN | ImageStatistics.MIN_MAX, marker_imp.getCalibration())
             self.log("DEBUG Pre-marker BEFORE blur: max={}, mean={}".format(pre_blur_stats.max, pre_blur_stats.mean))
             
-            # Preprocess marker: Median blur ALWAYS applied (bkd=0), as per macro logic.
+            # Apply Median blur IN-PLACE (no duplication, no background subtraction)
             # SynapseJ unconditionally applies: run("Median...", "radius="+PreBlurPx+" stack");
-            # We do NOT apply background subtraction to the marker channel, as we want to preserve broad structures.
-            processed_marker = self._preprocess_channel(marker_imp, True, self.pre_blur_radius, 0)
+            IJ.run(marker_imp, "Median...", "radius=" + str(self.pre_blur_radius) + " stack")
             
             # DEBUG: Check marker channel stats AFTER blur
-            post_blur_stats = ImageStatistics.getStatistics(processed_marker.getProcessor(), ImageStatistics.MEAN | ImageStatistics.MIN_MAX, processed_marker.getCalibration())
+            post_blur_stats = ImageStatistics.getStatistics(marker_imp.getProcessor(), ImageStatistics.MEAN | ImageStatistics.MIN_MAX, marker_imp.getCalibration())
             self.log("DEBUG Pre-marker AFTER blur (radius={}): max={}, mean={}".format(self.pre_blur_radius, post_blur_stats.max, post_blur_stats.mean))
+            
+            # Use the blurred marker channel for gating (same image that will be used in merge)
+            processed_marker = marker_imp
             
             # Filter pre-synaptic puncta against the pre-marker channel.
             # This removes any puncta that are not "on top of" the marker signal.
@@ -1147,9 +1151,15 @@ class SynapseJ4ChannelComplete(object):
             # Construct mask name for bug replication
             # SynapseJ uses LUPPre variable which is set based on PreMax (use_maxima)
             # PreCol is usually C4 (pre_channel)
-            pre_mask_name = "Mask of C{}-image".format(self.pre_channel)
-            if self.pre_use_maxima:
-                pre_mask_name += " Segmented"
+            # BUG: This mask measurement bug only affects the FIRST image in og2.
+            # Subsequent images have correct measurements on the marker channel.
+            pre_mask_name = None
+            if self._image_index == 0:
+                pre_mask_name = "Mask of C{}-image".format(self.pre_channel)
+                if self.pre_use_maxima:
+                    pre_mask_name += " Segmented"
+            
+            self.log("DEBUG: _image_index={}, pre_mask_name={}".format(self._image_index, pre_mask_name))
             
             pre_entries = self._filter_by_intensity(
                 pre_entries,
@@ -1160,7 +1170,9 @@ class SynapseJ4ChannelComplete(object):
                 pre_mask_imp,
                 name_short,
                 'PreThrResults.txt',
-                mask_name_for_bug=pre_mask_name
+                cal,
+                mask_name_for_bug=pre_mask_name,
+                marker_channel_name="C{}-image".format(self.pre_marker_channel)
             )
             pre_marker_count = len(pre_entries)
             self.log("Presynaptic marker gating: %d/%d puncta retained" % (pre_marker_count, pre_count_total))
@@ -1170,22 +1182,29 @@ class SynapseJ4ChannelComplete(object):
             if pre_marker_count > 0:
                 self.save_roi_set([entry['roi'] for entry in pre_entries], os.path.join(self.dest_dir, '{}PreThrRoiSet.zip'.format(name_short)), pre_result_imp, pre_roi_index_map)
             
-            # Clean up temporary images.
-            processed_marker.close()
-            marker_imp.close()
+            # No cleanup needed - we modified channels[] in-place, which is needed for the merge
 
         if self.post_marker_channel > 0 and self.post_marker_thresholds:
-            # Duplicate the marker channel.
-            marker_imp = channels[self.post_marker_channel - 1].duplicate()
+            # Apply Median blur IN-PLACE to the marker channel, matching macro behavior.
+            # The macro does: selectWindow(LUPFor); run("Median...", "radius="+PostBlurPx+" stack");
+            # This modifies C1-image in-place, which is then used both for marker gating AND the merge.
+            marker_imp = channels[self.post_marker_channel - 1]  # Direct reference, not duplicate
             
-            # Preprocess marker: Median blur ALWAYS applied (bkd=0), as per macro logic.
+            # Apply Median blur IN-PLACE (no duplication, no background subtraction)
             # SynapseJ unconditionally applies: run("Median...", "radius="+PostBlurPx+" stack");
-            processed_marker = self._preprocess_channel(marker_imp, True, self.post_blur_radius, 0)
+            IJ.run(marker_imp, "Median...", "radius=" + str(self.post_blur_radius) + " stack")
+            
+            # Use the blurred marker channel for gating (same image that will be used in merge)
+            processed_marker = marker_imp
             
             # Construct mask name for bug replication
-            post_mask_name = "Mask of C{}-image".format(self.post_channel)
-            if self.post_use_maxima:
-                post_mask_name += " Segmented"
+            # BUG: This mask measurement bug only affects the FIRST image in og2.
+            # Subsequent images have correct measurements on the marker channel.
+            post_mask_name = None
+            if self._image_index == 0:
+                post_mask_name = "Mask of C{}-image".format(self.post_channel)
+                if self.post_use_maxima:
+                    post_mask_name += " Segmented"
             
             # Filter post-synaptic puncta against the post-marker channel.
             post_entries = self._filter_by_intensity(
@@ -1197,7 +1216,9 @@ class SynapseJ4ChannelComplete(object):
                 post_mask_imp,
                 name_short,
                 'PstRResults.txt',
-                mask_name_for_bug=post_mask_name
+                cal,
+                mask_name_for_bug=post_mask_name,
+                marker_channel_name="C{}-image".format(self.post_marker_channel)
             )
             post_marker_count = len(post_entries)
             self.log("Postsynaptic marker gating: %d/%d puncta retained" % (post_marker_count, post_count_total))
@@ -1207,9 +1228,7 @@ class SynapseJ4ChannelComplete(object):
             if post_marker_count > 0:
                 self.save_roi_set([entry['roi'] for entry in post_entries], os.path.join(self.dest_dir, '{}PstRRoiSet.zip'.format(name_short)), post_result_imp, post_roi_index_map)
             
-            # Clean up.
-            processed_marker.close()
-            marker_imp.close()
+            # No cleanup needed - we modified channels[] in-place, which is needed for the merge
 
         self.log('  Pre detections (gated): {}'.format(len(pre_entries)))
         self.log('  Post detections (gated): {}'.format(len(post_entries)))
@@ -1237,33 +1256,37 @@ class SynapseJ4ChannelComplete(object):
         if syn_pre_rois:
             syn_pre_rows = self.measure_rois(syn_pre_rois, pre_result_imp, name_short, 'Pre', cal, 
                                               self.pre_params['min'], 65535, get_pre_slice_label)
+            # Per-image synaptic pre-synaptic results (Excel folder) - save BEFORE bug replication
+            # Per-image files have correct thresholds; only aggregate Syn Results has zeroed thresholds
+            self.save_results_table(self._filter_standard_metrics(syn_pre_rows), os.path.join(self.excel_dir, '{}PreResults.txt'.format(name_short)))
+            # Use pre_roi_index_map to preserve original indices from PreALLRoiSet
+            self.save_roi_set(syn_pre_rois, os.path.join(self.dest_dir, '{}PreSYNRoiSet.zip'.format(name_short)), pre_result_imp, pre_roi_index_map)
+            
             # MACRO BUG REPLICATION: In og2, the CollateResults function only copies 17 fields
             # (Label through MinFeret) and doesn't include MinThr/MaxThr. This means:
             # - First image: thresholds are preserved (Results table renamed directly)
             # - Subsequent images: MinThr=0, MaxThr=0 (fields not copied)
+            # Apply AFTER saving per-image files (which should have correct thresholds)
             if self._image_index > 0:
                 for row in syn_pre_rows:
                     row['MinThr'] = 0
                     row['MaxThr'] = 0
             self.syn_pre_results.extend(syn_pre_rows)
-            # Per-image synaptic pre-synaptic results (Excel folder) + per-macro aggregate
-            self.save_results_table(self._filter_standard_metrics(syn_pre_rows), os.path.join(self.excel_dir, '{}PreResults.txt'.format(name_short)))
-            # Use pre_roi_index_map to preserve original indices from PreALLRoiSet
-            self.save_roi_set(syn_pre_rois, os.path.join(self.dest_dir, '{}PreSYNRoiSet.zip'.format(name_short)), pre_result_imp, pre_roi_index_map)
 
         if syn_post_rois:
             syn_post_rows = self.measure_rois(syn_post_rois, post_result_imp, name_short, 'Post', cal,
                                                self.post_params['min'], 65535, get_post_slice_label)
+            # Per-image synaptic post-synaptic results (Excel folder) - save BEFORE bug replication
+            self.save_results_table(self._filter_standard_metrics(syn_post_rows), os.path.join(self.excel_dir, '{}PostResults.txt'.format(name_short)))
+            # Use post_roi_index_map to preserve original indices from PostALLRoiSet
+            self.save_roi_set(syn_post_rois, os.path.join(self.dest_dir, '{}PostSYNRoiSet.zip'.format(name_short)), post_result_imp, post_roi_index_map)
+            
             # MACRO BUG REPLICATION: Same as above for post-synaptic results.
             if self._image_index > 0:
                 for row in syn_post_rows:
                     row['MinThr'] = 0
                     row['MaxThr'] = 0
             self.syn_post_results.extend(syn_post_rows)
-            # Per-image synaptic post-synaptic results (Excel folder) + per-macro aggregate
-            self.save_results_table(self._filter_standard_metrics(syn_post_rows), os.path.join(self.excel_dir, '{}PostResults.txt'.format(name_short)))
-            # Use post_roi_index_map to preserve original indices from PostALLRoiSet
-            self.save_roi_set(syn_post_rois, os.path.join(self.dest_dir, '{}PostSYNRoiSet.zip'.format(name_short)), post_result_imp, post_roi_index_map)
 
         # Always save filtered images, even if no synapses were detected, to match macro behavior.
         # These images show the puncta after background subtraction and masking.
@@ -1308,8 +1331,11 @@ class SynapseJ4ChannelComplete(object):
         if post_label_map: post_label_map.close()
         
         # Save Overlay (4 channels, no outlines) - matches SynapseJ merge output
-        c1_imp = channels[0] # C1
-        c2_imp = channels[1] # C2
+        # NOTE: The macro applies Median blur IN-PLACE to marker channels (C1, C2) during marker gating.
+        # When the merge happens, it uses those blurred versions. We must replicate this behavior.
+        # The blur was already applied to channels[] during marker gating above (in-place via _preprocess_channel_inplace).
+        c1_imp = channels[0] # C1 (post_marker_channel, blurred if marker gating enabled)
+        c2_imp = channels[1] # C2 (pre_marker_channel, blurred if marker gating enabled)
         self.save_overlay(pre_result_imp, post_result_imp, c1_imp, c2_imp, name_short)
 
         # Generate Presentation Outputs (Batch Synapse Report only)
@@ -1446,7 +1472,7 @@ class SynapseJ4ChannelComplete(object):
                     'Perim.': stats.perimeter if hasattr(stats, 'perimeter') else roi.getLength(),
                     'Feret': stats.feret,
                     'IntDen': stats.integratedDensity,
-                    'RawIntDen': int(stats.rawIntegratedDensity) if hasattr(stats, 'rawIntegratedDensity') else 0,
+                    'RawIntDen': float(round(stats.rawIntegratedDensity)) if hasattr(stats, 'rawIntegratedDensity') else 0.0,
                     'FeretX': int(stats.feretX),
                     'FeretY': int(stats.feretY),
                     'FeretAngle': stats.feretAngle,
@@ -1909,13 +1935,13 @@ class SynapseJ4ChannelComplete(object):
                                     'Perim.': perim,
                                     'Feret': feret,
                                     'IntDen': int_den,
-                                    'RawIntDen': int(raw_int_den),
+                                    'RawIntDen': float(round(raw_int_den)),
                                     'FeretX': int(feret_x),
                                     'FeretY': int(feret_y),
                                     'FeretAngle': feret_angle,
                                     'MinFeret': min_feret,
-                                    'MinThr': min_thresh,
-                                    'MaxThr': max_thresh,
+                                    'MinThr': int(min_thresh),
+                                    'MaxThr': int(max_thresh),
                                     # Store pixel coords and slice for label generation
                                     '_x_pixel': x,
                                     '_y_pixel': y,
@@ -1985,6 +2011,10 @@ class SynapseJ4ChannelComplete(object):
         # We do this after flattening to ensure we have the correct per-slice indices
         # Complex Label format: {base_name}{label}F.tif:{ROI_name}:{slice_label}
         # Example: AK5-2001PreF.tif:0001-0034-0091:c:4/4 z:1/5 - AK5-2001.nd2 (series 1)
+        
+        # og2 format rule: if ANY component of a label exceeds 9999, use 5-digit format
+        # for ALL components of THAT label. Each label is formatted independently.
+        
         for slice_list in slice_results:
             for i, entry in enumerate(slice_list):
                 roi = entry['roi']
@@ -1994,9 +2024,11 @@ class SynapseJ4ChannelComplete(object):
                 r = roi.getBounds()
                 yc = r.y + r.height // 2
                 
-                # Format: SSSS-NNNN-YYYY
-                # Use 4 digits to match og2
-                roi_name = "{:04d}-{:04d}-{:04d}".format(slice_idx, i + 1, yc)
+                # Determine format for THIS label based on its component values
+                if slice_idx > 9999 or (i + 1) > 9999 or yc > 9999:
+                    roi_name = "{:05d}-{:05d}-{:05d}".format(slice_idx, i + 1, yc)
+                else:
+                    roi_name = "{:04d}-{:04d}-{:04d}".format(slice_idx, i + 1, yc)
                 roi.setName(roi_name)
                 
                 # Construct complex Label for CorrResults and Syn Results
@@ -2043,15 +2075,18 @@ class SynapseJ4ChannelComplete(object):
             return getattr(obj, name, default)
 
         # Robust Feret retrieval: Try ROI first (geometry based), then stats (pixel based)
-        # CRITICAL: roi.getFeretValues() returns values in PIXELS, so we must convert to calibrated units
+        # IMPORTANT: When roi.getImage() is set with a calibrated image, getFeretValues() and
+        # getLength() return values ALREADY in calibrated units (microns). When no image is set,
+        # they return pixel values. We check if ROI has an image to decide whether to convert.
         feret_vals = None
+        roi_has_calibrated_image = roi and roi.getImage() is not None
         try:
             if roi:
-                feret_vals = roi.getFeretValues() # [Feret, Angle, MinFeret, FeretX, FeretY] - in PIXELS!
+                feret_vals = roi.getFeretValues() # Returns calibrated if ROI has image, else pixels
         except:
             pass
 
-        # Get pixel width for converting Feret from pixels to calibrated units (um)
+        # Get pixel width for potential conversion (only used if ROI has no calibrated image)
         px_w = self._pixel_width(cal)
         
         feret = feret_vals[0] if feret_vals else get_stat(stats, 'feret')
@@ -2060,14 +2095,15 @@ class SynapseJ4ChannelComplete(object):
             # Approximate as circle diameter: Area = pi * (d/2)^2  =>  d = 2 * sqrt(Area / pi)
             # stats.area is already calibrated, so result is in calibrated units
             feret = 2 * math.sqrt(stats.area / math.pi)
-        else:
-            # Convert Feret from pixels to calibrated units
+        elif not roi_has_calibrated_image and feret_vals:
+            # Only convert if ROI doesn't have a calibrated image (values are in pixels)
             feret = feret * px_w
+        # else: feret is already calibrated (from feret_vals with calibrated image)
 
         feret_angle = feret_vals[1] if feret_vals else get_stat(stats, 'feretAngle')  # Angle doesn't need conversion
         min_feret = feret_vals[2] if feret_vals else get_stat(stats, 'minFeret')
-        # Convert MinFeret from pixels to calibrated units
-        if min_feret > 0 and feret_vals:
+        # Only convert MinFeret if ROI doesn't have a calibrated image
+        if min_feret > 0 and feret_vals and not roi_has_calibrated_image:
             min_feret = min_feret * px_w
         
         # FeretX and FeretY are pixel coordinates - convert to calibrated units
@@ -2133,18 +2169,18 @@ class SynapseJ4ChannelComplete(object):
             'Y': stats.yCentroid,
             'XM': stats.xCenterOfMass,
             'YM': stats.yCenterOfMass,
-            # Perimeter needs to be converted from pixels to calibrated units
-            # stats.perimeter may already be calibrated, but roi.getLength() is always in pixels
-            'Perim.': (get_stat(stats, 'perimeter') or (roi.getLength() if roi else 0)) * px_w,
+            # Perimeter: roi.getLength() returns calibrated value when ROI has a calibrated image,
+            # otherwise returns pixels. Only multiply by px_w if ROI has no calibrated image.
+            'Perim.': (get_stat(stats, 'perimeter') or (roi.getLength() if roi else 0)) * (1.0 if roi_has_calibrated_image else px_w),
             'Feret': feret,
             'IntDen': get_stat(stats, 'integratedDensity') or (stats.area * stats.mean), # Fallback if field missing
-            'RawIntDen': int(get_stat(stats, 'rawIntegratedDensity') or (stats.pixelCount * stats.mean)), # Fallback, stored as int
+            'RawIntDen': float(round(get_stat(stats, 'rawIntegratedDensity') or (stats.pixelCount * stats.mean))), # Fallback, stored as float with rounding
             'FeretX': int(feret_x),
             'FeretY': int(feret_y),
             'FeretAngle': feret_angle,
             'MinFeret': min_feret,
-            'MinThr': min_thr,
-            'MaxThr': max_thr,
+            'MinThr': int(min_thr),
+            'MaxThr': int(max_thr),
             'BBox Width (um)': bbox_width,
             'BBox Height (um)': bbox_height,
             
@@ -2251,32 +2287,66 @@ class SynapseJ4ChannelComplete(object):
                 # Write each line followed by a newline character.
                 handle.write(line + '\n')
 
-    def save_results_table(self, rows, path, add_row_numbers=True):
+    def save_results_table(self, rows, path, add_row_numbers=True, use_auto_format=False, first_image_label=None):
         """
         Save a list of dictionaries as a tab-separated value (TSV) file.
         
         This function handles the serialization of measurement data to disk.
         It ensures that the header row matches the keys of the dictionaries.
-        Values are formatted to match SynapseJ's output precision (3 decimal places).
         
         Args:
             rows (list): List of dictionaries, where each dictionary is a row.
             path (str): Output file path.
             add_row_numbers (bool): If True, add row numbers as first column (og2 format).
+            use_auto_format (bool): If True, use AUTO_FORMAT (variable precision).
+                                    If False, use fixed 3 decimal places.
+            first_image_label (str): If provided, rows with this Label (base name) use 3-decimal format,
+                                     all other rows use AUTO_FORMAT. This matches og2's
+                                     behavior for combined files where the first image
+                                     processed sets the table format, and subsequent
+                                     images switch to AUTO_FORMAT.
         """
         # If there are no rows, there is nothing to save.
         if not rows:
             return
         
-        # Use the 3-decimal format to match macro's "Set Measurements... decimal=3"
-        def format_val(key, val):
-            return SynapseJ4ChannelComplete.format_value_3dec(val)
+        # Helper to extract base name from Label (same logic as _filter_all_results_metrics)
+        def extract_base_name(full_label):
+            if not full_label:
+                return ''
+            if ':' in full_label:
+                first_part = full_label.split(':')[0]
+            else:
+                first_part = full_label
+            base_name = first_part
+            for suffix in ['PreF.tif', 'PostF.tif', 'Pre.tif', 'Post.tif', 
+                           'PreF', 'PostF', 'Pre', 'Post', '.tif', '.TIF']:
+                if base_name.endswith(suffix):
+                    base_name = base_name[:-len(suffix)]
+                    break
+            return base_name
+        
+        # Choose formatter based on file type and per-row label
+        def format_val(key, val, row_label=None):
+            if first_image_label is not None:
+                # Combined file: first image uses 3-dec, others use AUTO
+                # Extract base name from row_label for comparison
+                row_base_name = extract_base_name(row_label)
+                if row_base_name == first_image_label:
+                    return SynapseJ4ChannelComplete.format_value_3dec(val)
+                else:
+                    return SynapseJ4ChannelComplete.format_value(val)
+            elif use_auto_format:
+                return SynapseJ4ChannelComplete.format_value(val)
+            else:
+                return SynapseJ4ChannelComplete.format_value_3dec(val)
         
         formatted_rows = []
         for row in rows:
             formatted_row = OrderedDict()
+            row_label = row.get('Label', '')
             for key, val in row.items():
-                formatted_row[key] = format_val(key, val)
+                formatted_row[key] = format_val(key, val, row_label)
             formatted_rows.append(formatted_row)
             
         # Open the file for writing.
@@ -2534,24 +2604,45 @@ class SynapseJ4ChannelComplete(object):
         # Save the summary table (Collated ResultsIF) which contains one row per image.
         if self.results_summary:
             self.save_results_table(self.results_summary, os.path.join(self.dest_dir, 'Collated ResultsIF.txt'))
+        
+        # Determine the first image label for combined files.
+        # og2 behavior: first image processed uses 3-decimal format, subsequent images use AUTO_FORMAT.
+        # We need to extract the base label the same way _filter_all_results_metrics does.
+        first_image_label = None
+        if self.all_pre_results:
+            full_label = self.all_pre_results[0].get('Label', None)
+            if full_label:
+                # Apply same label extraction logic as _filter_all_results_metrics
+                if ':' in full_label:
+                    first_part = full_label.split(':')[0]
+                else:
+                    first_part = full_label
+                base_name = first_part
+                for suffix in ['PreF.tif', 'PostF.tif', 'Pre.tif', 'Post.tif', 
+                               'PreF', 'PostF', 'Pre', 'Post', '.tif', '.TIF']:
+                    if base_name.endswith(suffix):
+                        base_name = base_name[:-len(suffix)]
+                        break
+                first_image_label = base_name
             
         # Save the detailed list of ALL detected pre-synaptic puncta (before synapse filtering).
         # Use _filter_all_results_metrics for simple Label format (no thresholds)
+        # Combined files use first_image_label to match og2's per-image formatting behavior.
         if self.all_pre_results:
-            self.save_results_table(self._filter_all_results_metrics(self.all_pre_results), os.path.join(self.dest_dir, 'All Pre Results.txt'))
+            self.save_results_table(self._filter_all_results_metrics(self.all_pre_results), os.path.join(self.dest_dir, 'All Pre Results.txt'), first_image_label=first_image_label)
             
         # Save the detailed list of ALL detected post-synaptic puncta (before synapse filtering).
         if self.all_post_results:
-            self.save_results_table(self._filter_all_results_metrics(self.all_post_results), os.path.join(self.dest_dir, 'All Post Results.txt'))
+            self.save_results_table(self._filter_all_results_metrics(self.all_post_results), os.path.join(self.dest_dir, 'All Post Results.txt'), first_image_label=first_image_label)
             
         # Save the list of CONFIRMED synaptic pre-puncta (those that colocalized).
         # Use _filter_standard_metrics for full Label format (with thresholds)
         if self.syn_pre_results:
-            self.save_results_table(self._filter_standard_metrics(self.syn_pre_results), os.path.join(self.dest_dir, 'Syn Pre Results.txt'))
+            self.save_results_table(self._filter_standard_metrics(self.syn_pre_results), os.path.join(self.dest_dir, 'Syn Pre Results.txt'), first_image_label=first_image_label)
             
         # Save the list of CONFIRMED synaptic post-puncta (those that colocalized).
         if self.syn_post_results:
-            self.save_results_table(self._filter_standard_metrics(self.syn_post_results), os.path.join(self.dest_dir, 'Syn Post Results.txt'))
+            self.save_results_table(self._filter_standard_metrics(self.syn_post_results), os.path.join(self.dest_dir, 'Syn Post Results.txt'), first_image_label=first_image_label)
             
         # Save the paired synapse data (currently unused/empty in this implementation but kept for compatibility).
         if self.synapse_pair_rows:
@@ -2911,12 +3002,34 @@ class SynapseJ4ChannelComplete(object):
                 # Get the processor for this slice (slice_idx is already 1-based)
                 ip = stack.getProcessor(slice_idx)
                 
+                # CRITICAL: Set threshold on processor before measuring!
+                # The macro's "Set Measurements" with "limit" option requires a threshold.
+                # Without this, measurements include 0-value pixels from mask subtraction,
+                # causing Min=0 instead of the actual minimum within the punctum.
+                # Ref: SynapseJ_v_1.ijm line 561: setThreshold(ImLOW,65535) before Analyze Particles
+                # The threshold persists on the Result image when roiManager("Measure") is called.
+                ip.setThreshold(min_thr, max_thr, ImageProcessor.NO_LUT_UPDATE)
+                
                 results = []
                 for idx, roi in rois_by_slice[slice_idx]:
                     try:
                         # Set ROI on the processor (not the ImagePlus)
                         ip.setRoi(roi)
-                        # Calculate statistics
+                        
+                        # CRITICAL FIX FOR FERET CALIBRATION:
+                        # roi.getFeretValues() gets calibration from roi.getImage().getCalibration()
+                        # If the ROI has no associated image, it defaults to pw=ph=1.0 (pixels).
+                        # We must set the image on the ROI so Feret values use correct calibration.
+                        # This matches ParticleAnalyzer behavior (PA calls roi.setImage(imp) before measuring).
+                        #
+                        # ADDITIONAL CRITICAL: When use_original_broken_global_calibration=True,
+                        # the 'cal' parameter differs from imp.getCalibration(). We must ALSO
+                        # set the calibration on 'imp' to match 'cal' so roi.getFeretValues()
+                        # uses the correct (global) calibration for the second image.
+                        imp.setCalibration(cal)
+                        roi.setImage(imp)
+                        
+                        # Calculate statistics (now respects threshold due to LIMIT flag)
                         stats = ImageStatistics.getStatistics(ip, MEASUREMENT_FLAGS, cal)
                         # Generate metrics
                         metrics = self._metrics_dict(
@@ -3217,8 +3330,11 @@ class SynapseJ4ChannelComplete(object):
                 VPerROI = 0
                 VIDPerROI = 0
                 
-                # Iterate through found overlapping labels
-                for n, count in overlap_counts.items():
+                # Iterate through found overlapping labels IN SORTED ORDER
+                # The macro iterates through histogram bins 0 to VC-1 sequentially,
+                # so we must process partner IDs in ascending order to match.
+                for n in sorted(overlap_counts.keys()):
+                    count = overlap_counts[n]
                     # Found an overlapping partner with ID 'n'.
                     # Retrieve its metrics (ID is 1-based, list is 0-based).
                     if n-1 < len(partner_entries):
@@ -3300,7 +3416,8 @@ class SynapseJ4ChannelComplete(object):
         return [x[1] for x in all_results]
 
     def _filter_by_intensity(self, entries, marker_imp, thresholds, label,
-                              result_imp, mask_imp, base_name, excel_suffix, mask_name_for_bug=None):
+                              result_imp, mask_imp, base_name, excel_suffix, 
+                              cal, mask_name_for_bug=None, marker_channel_name=None):
         """
         Filter ROIs based on Min/Max intensity in the marker channel.
 
@@ -3324,9 +3441,11 @@ class SynapseJ4ChannelComplete(object):
             result_imp (ImagePlus): The result image to clear rejected puncta from.
             mask_imp (ImagePlus): The mask image to clear rejected puncta from.
             base_name (str): Base filename.
-            excel_suffix (str): Suffix for the output Excel file (unused in this port but kept for API compatibility).
+            excel_suffix (str): Suffix for the output Excel file.
             mask_name_for_bug (str, optional): Name of the mask image to replicate the SynapseJ bug where
                 measurements are taken on the mask instead of the marker channel.
+            marker_channel_name (str, optional): Name of the marker channel (e.g., "C2-image") for Label.
+                Used when mask_name_for_bug is None (second image onwards).
             
         Returns:
             list: The subset of entries that passed the intensity filter.
@@ -3344,7 +3463,10 @@ class SynapseJ4ChannelComplete(object):
             entries_by_slice[p].append((i, entry))
             
         marker_stack = marker_imp.getStack()
-        cal = marker_imp.getCalibration()
+        # Use the passed calibration (respects global calibration mode)
+        # instead of marker_imp.getCalibration() which has the image's own calibration
+        # Also set it on marker_imp so roi.getFeretValues() uses correct calibration
+        marker_imp.setCalibration(cal)
         
         # Phase 1: Parallel Check
         # We iterate through all ROIs and check their intensity in the marker channel.
@@ -3398,16 +3520,24 @@ class SynapseJ4ChannelComplete(object):
                             # MACRO BUG REPLICATION:
                             # If mask_name_for_bug is provided, we simulate the bug where SynapseJ measures
                             # the Mask image (65535) instead of the Marker image.
-                            
-                            target_base_name = base_name
-                            target_stats = stats
+                            # For second image onwards (mask_name_for_bug=None), use marker_channel_name.
                             
                             if mask_name_for_bug:
                                 target_base_name = mask_name_for_bug
-                                # Create fake stats for 65535 mask
-                                # We can't easily create a new ImageStatistics object, so we modify the dict later
-                                pass
+                            elif marker_channel_name:
+                                target_base_name = marker_channel_name
+                            else:
+                                target_base_name = base_name
+                            target_stats = stats
+                            
+                            if mask_name_for_bug:
+                                pass  # Will overwrite values below
 
+                            # Set ROI's image for correct Feret calibration (like in measure_rois)
+                            roi.setImage(marker_imp)
+                            
+                            # For PreThrResults/PstRResults, og2 always has MinThr=0, MaxThr=65535
+                            # This is because these are marker channel measurements, not punctum detection
                             metrics = self._metrics_dict(
                                 target_base_name,
                                 label,
@@ -3415,9 +3545,31 @@ class SynapseJ4ChannelComplete(object):
                                 target_stats,
                                 cal,
                                 roi,
-                                entry['metrics'].get('MinThr', 0),
-                                entry['metrics'].get('MaxThr', 65535),
+                                0,      # MinThr is always 0 for marker results
+                                65535,  # MaxThr is always 65535 for marker results
                             )
+                            
+                            # Fix Label format - extract slice_label from original entry's label
+                            # Original format: {image}PreF.tif:{roi_name}:{slice_label}
+                            # For mask bug: {mask_name}:{roi_name}:{slice_number}
+                            # For normal: {marker_channel_name}:{roi_name}:{slice_label}
+                            roi_name = roi.getName()
+                            orig_label = entry['metrics'].get('Label', '')
+                            # Extract slice_label from orig_label (after second colon)
+                            parts = orig_label.split(':', 2)
+                            slice_label = parts[2] if len(parts) > 2 else ''
+                            
+                            # For normal case, fix the channel number in slice_label
+                            # slice_label format: "c:X/Y z:Z/N - ImageName #N"
+                            # We need to replace X with the marker channel number
+                            if marker_channel_name and slice_label:
+                                import re
+                                # Extract marker channel number from marker_channel_name (e.g., "C2-image" -> "2")
+                                marker_ch_match = re.match(r'C(\d+)-', marker_channel_name)
+                                if marker_ch_match:
+                                    marker_ch_num = marker_ch_match.group(1)
+                                    # Replace "c:X/" with "c:{marker_ch_num}/" in slice_label
+                                    slice_label = re.sub(r'c:\d+/', 'c:{}/'.format(marker_ch_num), slice_label)
                             
                             if mask_name_for_bug:
                                 # Overwrite intensity values to match Mask (inverted 16-bit)
@@ -3429,33 +3581,22 @@ class SynapseJ4ChannelComplete(object):
                                 # PixelCount = Area / PixelArea
                                 px_area = cal.pixelWidth * cal.pixelHeight
                                 if px_area > 0:
-                                    metrics['RawIntDen'] = int((metrics['Area'] / px_area) * 65535)
+                                    metrics['RawIntDen'] = float(round((metrics['Area'] / px_area) * 65535))
                                 else:
-                                    metrics['RawIntDen'] = int(metrics['Area'] * 65535)
-                                    
-                                # Also, the Label should NOT have the :label:index suffix if we pass the full name?
-                                # og2 Label: Mask of C4-image Segmented:0001-0030-0083:1
-                                # Our _metrics_dict constructs: base_name:label:index
-                                # If base_name is "Mask...", label is "Presynaptic Marker", index is 1.
-                                # Result: Mask...:Presynaptic Marker:1
-                                # og2 Result: Mask...:0001-0030-0083:1
-                                # It seems og2 uses the ROI Name as the middle part!
-                                # "0001-0030-0083" is the ROI Name we generated.
-                                # So we should use the ROI Name in the label.
+                                    metrics['RawIntDen'] = float(round(metrics['Area'] * 65535))
                                 
-                                roi_name = roi.getName()
+                                # For mask (uniform intensity), XM=X and YM=Y since all pixels have same weight
+                                metrics['XM'] = metrics['X']
+                                metrics['YM'] = metrics['Y']
+                                    
+                                # og2 Label format for mask bug: {mask_name}:{roi_name}:{slice_number}
+                                # The last number is the slice number (1-based)
                                 if roi_name:
-                                    metrics['Label'] = "{}:{}:{}".format(mask_name_for_bug, roi_name, 1) # Index is always 1 in og2 example?
-                                    # og2 example: ...:1.
-                                    # Is it always 1? Or is it the index?
-                                    # Row 1: ...:1
-                                    # Row 2: ...:1
-                                    # Row 3: ...:1
-                                    # It seems it's always 1? Or maybe it's the stack slice?
-                                    # "1" at the end.
-                                    # Let's assume it's 1 for now or check more rows.
-                                    # Actually, let's just use the index we have.
-                                    metrics['Label'] = "{}:{}:{}".format(mask_name_for_bug, roi_name, 1)
+                                    metrics['Label'] = "{}:{}:{}".format(mask_name_for_bug, roi_name, slice_idx)
+                            else:
+                                # Normal case (second image onwards): {marker_channel_name}:{roi_name}:{slice_label}
+                                if roi_name and marker_channel_name:
+                                    metrics['Label'] = "{}:{}:{}".format(marker_channel_name, roi_name, slice_label)
 
                             slice_marker_rows.append((idx, metrics))
                     except:
@@ -3537,7 +3678,7 @@ class SynapseJ4ChannelComplete(object):
         # If any puncta were retained, save their marker channel measurements to disk.
         if marker_rows:
             out_path = os.path.join(self.excel_dir, base_name + excel_suffix)
-            self.save_results_table(marker_rows, out_path)
+            self.save_results_table(self._filter_standard_metrics(marker_rows), out_path)
 
         return kept_entries
 
