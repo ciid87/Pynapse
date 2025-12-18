@@ -40,4 +40,11 @@ dilate_pixels=0
 slice_number=5
 
 # Parallelization options.
+# - 'auto' (default): Automatically determine parallelism based on first image's memory usage
+# - Integer (e.g., 4): Run exactly that many Fiji instances in parallel
+# - 1, '1', 'false', or '0': Sequential processing (one at a time)
 parallel_fiji=auto
+
+# Bug replication flags
+replicate_threshold_bug=false
+use_original_broken_global_calibration=false
