@@ -10,12 +10,21 @@ This script implements the image processing pipeline described in the SynapseJ p
 for the automated detection and quantification of synapses in immunofluorescence images.
 It replicates the logic of the original ImageJ macro (SynapseJ_v_1.ijm) but is 
 adapted for headless execution in a cluster environment using Jython.
+
+MEMORY-EFFICIENT MODE:
+To avoid JVM memory pressure when processing many images, Pynapse can run in 
+"per-image" mode where each image is processed in a fresh Fiji instance.
+Results are saved as intermediate JSON files and aggregated at the end by CPython.
 """
 
 import os
 import sys
 import math
 import csv
+import json
+import time
+import subprocess
+import tempfile
 from collections import defaultdict, OrderedDict
 from datetime import datetime
 
@@ -23,11 +32,14 @@ from datetime import datetime
 def is_jython():
     return sys.platform.startswith('java')
 
+# =============================================================================
+# CPYTHON-ONLY FUNCTIONS (orchestration and aggregation)
+# =============================================================================
 if not is_jython():
-    # We are running in standard Python (CPython).
-    # We need to find Fiji and launch this script using it.
     import subprocess
     import shutil
+    import tempfile
+    import glob
     
     CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".pynapse_config")
     
@@ -41,10 +53,10 @@ if not is_jython():
         
         # Check common locations
         common_paths = [
-            "Fiji.app/ImageJ-linux64", # Relative
+            "Fiji.app/ImageJ-linux64",
             "Fiji.app/ImageJ-win64.exe",
             "Fiji.app/Contents/MacOS/ImageJ-macosx",
-            "fiji-linux-x64", # Relative (from user's previous setup)
+            "fiji-linux-x64",
             "Fiji/fiji-linux-x64",
             "/Applications/Fiji.app/Contents/MacOS/ImageJ-macosx"
         ]
@@ -56,26 +68,21 @@ if not is_jython():
 
     def setup_fiji():
         print("Fiji not found. Setting up...")
-        # Download
         if not os.path.exists("fiji-latest-linux64-jdk.zip"):
             print("Downloading Fiji...")
             subprocess.check_call(["wget", "https://downloads.imagej.net/fiji/latest/fiji-latest-linux64-jdk.zip"])
         
-        # Unzip
         if not os.path.exists("Fiji.app") and not os.path.exists("Fiji"):
             print("Unzipping...")
             subprocess.check_call(["unzip", "-q", "fiji-latest-linux64-jdk.zip"])
             
-        # Locate binary after unzip
-        # The zip usually creates 'Fiji.app'
         fiji_bin = None
         if os.path.exists("Fiji.app/ImageJ-linux64"):
             fiji_bin = os.path.abspath("Fiji.app/ImageJ-linux64")
-        elif os.path.exists("Fiji/fiji-linux-x64"): # User's specific structure
+        elif os.path.exists("Fiji/fiji-linux-x64"):
              fiji_bin = os.path.abspath("Fiji/fiji-linux-x64")
              
         if not fiji_bin:
-             # Fallback search
              for root, dirs, files in os.walk("."):
                  if "ImageJ-linux64" in files:
                      fiji_bin = os.path.abspath(os.path.join(root, "ImageJ-linux64"))
@@ -89,77 +96,887 @@ if not is_jython():
         else:
             raise Exception("Could not locate Fiji binary after installation.")
 
-    fiji_path = get_fiji_path()
-    
-    if not fiji_path:
-        print("Fiji not found.")
+    def parse_config_file(config_path):
+        """Parse config file in CPython, merging with defaults."""
+        # Start with defaults (CPython version)
+        config = {
+            'parallel_fiji': 'auto',  # Default to auto-parallelism based on memory
+            'replicate_threshold_bug': False,
+            'use_original_broken_global_calibration': False,
+        }
+        
+        # Override with config file values
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        # Handle booleans
+                        if value.lower() in ['true', 'false']:
+                            config[key] = value.lower() == 'true'
+                        else:
+                            try:
+                                config[key] = int(value)
+                            except ValueError:
+                                try:
+                                    config[key] = float(value)
+                                except ValueError:
+                                    config[key] = value
+        return config
+
+    def get_image_files(source_dir):
+        """Get list of image files to process."""
+        image_files = []
+        for name in sorted(os.listdir(source_dir)):
+            lower = name.lower()
+            if lower.endswith('.tif') or lower.endswith('.tiff') or lower.endswith('.nd2'):
+                image_files.append(os.path.join(source_dir, name))
+        return image_files
+
+    def aggregate_intermediate_results(dest_dir, config):
+        """
+        Aggregate all intermediate JSON results into final output files.
+        This runs in CPython after all Fiji instances have completed.
+        
+        Uses Polars for fast DataFrame operations. Must exactly match the
+        format of Jython save_all_results() output.
+        """
+        import polars as pl
+        from concurrent.futures import ThreadPoolExecutor
+        import time
+        
+        print("\n" + "="*80)
+        print("AGGREGATING RESULTS (Polars)")
+        print("="*80)
+        
+        start_time = time.time()
+        
+        intermediate_dir = os.path.join(dest_dir, '_intermediate')
+        if not os.path.exists(intermediate_dir):
+            print("ERROR: No intermediate results found at {}".format(intermediate_dir))
+            return
+        
+        # Collect all intermediate JSON files
+        json_files = sorted(glob.glob(os.path.join(intermediate_dir, '*.json')))
+        print("Found {} intermediate result files".format(len(json_files)))
+        
+        if not json_files:
+            print("No files to aggregate")
+            return
+        
+        # Column definitions
+        ALL_RESULTS_COLUMNS = [
+            'Label', 'Area', 'Mean', 'Min', 'Max', 'X', 'Y', 'XM', 'YM', 
+            'Perim.', 'Feret', 'IntDen', 'RawIntDen', 'FeretX', 'FeretY', 
+            'FeretAngle', 'MinFeret'
+        ]
+        SYN_RESULTS_COLUMNS = ALL_RESULTS_COLUMNS + ['MinThr', 'MaxThr']
+        SUMMARY_COLUMNS = [
+            'Label', 'Synapse Post No.', 'Synapse Pre No.', 'Thr Pre No.', 
+            'Fourth Post No.', 'Post No.', 'Pre No.'
+        ]
+        
+        # Load all JSON files in parallel using ThreadPoolExecutor
+        def load_json(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+        
+        print("  Loading {} JSON files in parallel...".format(len(json_files)))
+        with ThreadPoolExecutor() as executor:
+            all_data = list(executor.map(load_json, json_files))
+        
+        # Use Polars to efficiently concatenate data from all files
+        # Each data type gets its own list for pl.concat()
+        results_summary_dfs = []
+        all_pre_dfs = []
+        all_post_dfs = []
+        syn_pre_dfs = []
+        syn_post_dfs = []
+        pre_corr_list = []
+        post_corr_list = []
+        batch_dfs = []
+        log_list = []
+        
+        for data in all_data:
+            if data.get('results_summary'):
+                results_summary_dfs.append(pl.DataFrame(data['results_summary']))
+            if data.get('all_pre_results'):
+                all_pre_dfs.append(pl.DataFrame(data['all_pre_results']))
+            if data.get('all_post_results'):
+                all_post_dfs.append(data['all_post_results'])  # Keep as list for label transform
+            if data.get('syn_pre_results'):
+                syn_pre_dfs.append(pl.DataFrame(data['syn_pre_results']))
+            if data.get('syn_post_results'):
+                syn_post_dfs.append(pl.DataFrame(data['syn_post_results']))
+            if data.get('pre_correlation_rows'):
+                pre_corr_list.extend(data['pre_correlation_rows'])
+            if data.get('post_correlation_rows'):
+                post_corr_list.extend(data['post_correlation_rows'])
+            if data.get('batch_synapse_rows'):
+                batch_dfs.append(pl.DataFrame(data['batch_synapse_rows']))
+            if data.get('log_messages'):
+                log_list.extend(data['log_messages'])
+        
+        print("  Data loaded in {:.2f}s".format(time.time() - start_time))
+        print("\nWriting aggregated output files...")
+        
+        # Vectorized label extraction using Polars string operations
+        # This is MUCH faster than map_elements for large datasets
+        def simplify_labels_vectorized(df):
+            """Extract base name from Label column using vectorized Polars operations."""
+            if 'Label' not in df.columns or df.is_empty():
+                return df
+            
+            # Extract part before ':' if present, then strip suffixes
+            # Using map_elements for the suffix stripping since Polars doesn't have
+            # a clean way to do conditional suffix removal
+            def extract_base_name(label):
+                if not label:
+                    return ''
+                if ':' in label:
+                    first_part = label.split(':')[0]
+                else:
+                    first_part = label
+                for suffix in ['PreF.tif', 'PostF.tif', 'Pre.tif', 'Post.tif', 
+                               'PreF', 'PostF', 'Pre', 'Post', '.tif', '.TIF']:
+                    if first_part.endswith(suffix):
+                        return first_part[:-len(suffix)]
+                return first_part
+            
+            return df.with_columns(
+                pl.col('Label').map_elements(extract_base_name, return_dtype=pl.Utf8).alias('Label')
+            )
+        
+        # Vectorized numeric formatting using Polars expressions
+        # Replicates ImageJ's AUTO_FORMAT and 3-decimal format behaviors
+        import math
+        
+        def format_value_auto(val):
+            """
+            Format a value using ImageJ's AUTO_FORMAT (variable precision).
+            Replicates IJ.d2s(x, significantDigits=4, maxDigits=9) algorithm.
+            """
+            if val is None:
+                return ''
+            if isinstance(val, str):
+                return val
+            if val == 0:
+                return '0'
+            
+            # IJ.d2s algorithm
+            significantDigits = 4
+            maxDigits = 9
+            
+            abs_val = abs(val)
+            log10 = math.log10(abs_val)
+            roundErrorAtMax = 0.223 * (10 ** (-maxDigits))
+            magnitude = int(math.ceil(log10 + roundErrorAtMax))
+            
+            decimals = maxDigits - magnitude
+            
+            # Check for scientific notation conditions
+            if decimals < 0 or magnitude < significantDigits + 1 - maxDigits:
+                format_str = '{{:.{}e}}'.format(significantDigits - 1)
+                formatted = format_str.format(val)
+                return formatted.upper().replace('E+0', 'E').replace('E-0', 'E-')
+            
+            # If decimals > significantDigits, reduce
+            if decimals > significantDigits:
+                decimals = max(significantDigits, decimals - maxDigits + significantDigits)
+            
+            # Clamp to 0-9 range
+            decimals = max(0, min(9, decimals))
+            
+            # Format with calculated decimal places
+            format_str = '{{:.{}f}}'.format(decimals)
+            formatted = format_str.format(val)
+            
+            # Strip trailing zeros (matches Interpreter.toString())
+            while formatted.endswith('0') and '.' in formatted and 'E' not in formatted:
+                formatted = formatted[:-1]
+            if formatted.endswith('.'):
+                formatted = formatted[:-1]
+            
+            return formatted
+        
+        def format_value_3dec(val):
+            """Format value with exactly 3 decimal places (ImageJ decimal=3 mode)."""
+            if val is None:
+                return ''
+            if isinstance(val, str):
+                return val
+            # True integers show without decimals, floats always show .000
+            if isinstance(val, int):
+                return str(val)
+            if isinstance(val, float):
+                if val == 0:
+                    return '0'
+                return '{:.3f}'.format(val)
+            return str(val)
+        
+        def format_numeric_columns(df, columns, first_image_label=None):
+            """
+            Format numeric columns matching legacy ImageJ behavior.
+            
+            If first_image_label is provided, rows from first image use 3-decimal format,
+            subsequent images use AUTO_FORMAT. This matches og2's per-image format switching.
+            """
+            if df.is_empty():
+                return df
+            
+            # Get the Label column for per-row format decision
+            labels = df['Label'].to_list() if 'Label' in df.columns else [None] * len(df)
+            
+            # Extract base name from labels for comparison (handles both simplified and full labels)
+            def extract_base(lbl):
+                if not lbl:
+                    return ''
+                # Handle full labels like "SF_R26PreF.tif:0001-0002-0164:..."
+                if ':' in lbl:
+                    first_part = lbl.split(':')[0]
+                else:
+                    first_part = lbl
+                # Strip suffixes to get base name
+                for suffix in ['PreF.tif', 'PostF.tif', 'Pre.tif', 'Post.tif', 
+                               'PreF', 'PostF', 'Pre', 'Post', '.tif', '.TIF']:
+                    if first_part.endswith(suffix):
+                        return first_part[:-len(suffix)]
+                return first_part
+            
+            for col in columns:
+                if col not in df.columns:
+                    continue
+                dtype = df[col].dtype
+                if dtype not in [pl.Float64, pl.Float32]:
+                    continue
+                
+                values = df[col].to_list()
+                formatted = []
+                
+                for i, val in enumerate(values):
+                    lbl = labels[i] if i < len(labels) else None
+                    base_name = extract_base(lbl)
+                    
+                    if first_image_label is not None and base_name == first_image_label:
+                        # First image: 3-decimal format
+                        formatted.append(format_value_3dec(val))
+                    elif first_image_label is not None:
+                        # Subsequent images: AUTO_FORMAT
+                        formatted.append(format_value_auto(val))
+                    else:
+                        # No first_image_label: use 3-decimal format (excel files)
+                        formatted.append(format_value_3dec(val))
+                
+                df = df.with_columns(pl.Series(col, formatted))
+            
+            # Handle integer columns
+            for col in columns:
+                if col not in df.columns:
+                    continue
+                dtype = df[col].dtype
+                if dtype in [pl.Int64, pl.Int32, pl.Int16, pl.Int8]:
+                    df = df.with_columns(
+                        pl.when(pl.col(col).is_null())
+                        .then(pl.lit(''))
+                        .otherwise(pl.col(col).cast(pl.Utf8))
+                        .alias(col)
+                    )
+            
+            return df
+        
+        # Write TSV with row numbers (matching ImageJ format)
+        def write_tsv_with_row_numbers(df, path, columns, first_image_label=None):
+            """Write DataFrame to TSV with row numbers and exact ImageJ formatting."""
+            if df.is_empty():
+                return 0
+            
+            # Select and order columns
+            available_cols = [c for c in columns if c in df.columns]
+            df = df.select(available_cols)
+            
+            # Add row numbers (1-based)
+            df = df.with_row_index('_row', offset=1)
+            
+            # Format numeric columns (with per-image format switching if first_image_label provided)
+            df = format_numeric_columns(df, available_cols, first_image_label=first_image_label)
+            
+            # Write with custom format: " \t" header prefix, "N\t" row prefix
+            with open(path, 'w') as f:
+                f.write(' \t' + '\t'.join(columns) + '\n')
+                # Use write_csv to StringIO then post-process for speed
+                import io
+                buf = io.StringIO()
+                df.write_csv(buf, separator='\t', include_header=False)
+                buf.seek(0)
+                f.write(buf.read())
+            
+            return len(df)
+        
+        # Determine first image label for combined files (matches og2 behavior)
+        first_image_label = None
+        if all_pre_dfs:
+            first_df = all_pre_dfs[0]
+            if 'Label' in first_df.columns and len(first_df) > 0:
+                # Get first label and extract base name
+                full_label = first_df['Label'][0]
+                if full_label:
+                    if ':' in full_label:
+                        first_part = full_label.split(':')[0]
+                    else:
+                        first_part = full_label
+                    base_name = first_part
+                    for suffix in ['PreF.tif', 'PostF.tif', 'Pre.tif', 'Post.tif', 
+                                   'PreF', 'PostF', 'Pre', 'Post', '.tif', '.TIF']:
+                        if base_name.endswith(suffix):
+                            base_name = base_name[:-len(suffix)]
+                            break
+                    first_image_label = base_name
+        
+        print("  First image label for format switching: {}".format(first_image_label))
+        
+        # === Write Collated ResultsIF ===
+        if results_summary_dfs:
+            df = pl.concat(results_summary_dfs, how='diagonal')
+            n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'Collated ResultsIF.txt'), SUMMARY_COLUMNS)
+            print("  Saved: Collated ResultsIF.txt ({} rows)".format(n))
+        
+        # === Write All Pre Results (with simplified labels) ===
+        if all_pre_dfs:
+            df = pl.concat(all_pre_dfs, how='diagonal')
+            df = simplify_labels_vectorized(df)
+            n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'All Pre Results.txt'), ALL_RESULTS_COLUMNS, first_image_label=first_image_label)
+            print("  Saved: All Pre Results.txt ({} rows)".format(n))
+        
+        # === Write All Post Results (with simplified labels) ===
+        if all_post_dfs:
+            # Flatten the list of lists and create DataFrame
+            all_post_flat = []
+            for lst in all_post_dfs:
+                all_post_flat.extend(lst)
+            if all_post_flat:
+                df = pl.DataFrame(all_post_flat)
+                df = simplify_labels_vectorized(df)
+                n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'All Post Results.txt'), ALL_RESULTS_COLUMNS, first_image_label=first_image_label)
+                print("  Saved: All Post Results.txt ({} rows)".format(n))
+        
+        # === Write Syn Pre Results ===
+        if syn_pre_dfs:
+            df = pl.concat(syn_pre_dfs, how='diagonal')
+            n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'Syn Pre Results.txt'), SYN_RESULTS_COLUMNS, first_image_label=first_image_label)
+            print("  Saved: Syn Pre Results.txt ({} rows)".format(n))
+        
+        # === Write Syn Post Results ===
+        if syn_post_dfs:
+            df = pl.concat(syn_post_dfs, how='diagonal')
+            n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'Syn Post Results.txt'), SYN_RESULTS_COLUMNS, first_image_label=first_image_label)
+            print("  Saved: Syn Post Results.txt ({} rows)".format(n))
+        
+        # === Write correlation results (pre-formatted TSV strings) ===
+        CORR_HEADER = "Image Name\tArea\tMean\tMin\tMax\tX\tY\tXM\tYM\tPerim.\tFeret\tIntDen\tRawIntDen\tFeretX\tFeretY\tFeretAngle\tMinFeret\tImage Name\tArea\tMean\tMin\tMax\tX\tY\tXM\tYM\tPerim.\tFeret\tIntDen\tRawIntDen\tFeretX\tFeretY\tFeretAngle\tMinFeret\tNo. of Post/Pre Puncta \tPost IntDen\tPostsynaptic Puncta No.\tOverlap\tDistance\tDistance M"
+        CORR_HEADER2 = CORR_HEADER.replace('Post/Pre', 'Pre/Post').replace('Post IntDen', 'Pre IntDen').replace('Postsynaptic', 'Presynaptic')
+        
+        if pre_corr_list:
+            with open(os.path.join(dest_dir, 'CorrResults.txt'), 'w') as f:
+                f.write(CORR_HEADER + '\n')
+                f.write('\n'.join(pre_corr_list) + '\n')
+            print("  Saved: CorrResults.txt ({} rows)".format(len(pre_corr_list)))
+        
+        if post_corr_list:
+            with open(os.path.join(dest_dir, 'CorrResults2.txt'), 'w') as f:
+                f.write(CORR_HEADER2 + '\n')
+                f.write('\n'.join(post_corr_list) + '\n')
+            print("  Saved: CorrResults2.txt ({} rows)".format(len(post_corr_list)))
+        
+        # === Write batch synapse report ===
+        present_dir = os.path.join(dest_dir, 'present')
+        if not os.path.exists(present_dir):
+            os.makedirs(present_dir)
+        
+        if batch_dfs:
+            df = pl.concat(batch_dfs, how='diagonal')
+            df.write_csv(os.path.join(present_dir, 'Batch_Synapse_Report.csv'))
+            print("  Saved: Batch_Synapse_Report.csv ({} rows)".format(len(df)))
+        
+        # === Write combined log ===
+        if log_list:
+            with open(os.path.join(dest_dir, 'IFALog.txt'), 'w') as f:
+                f.write('\n'.join(log_list))
+            print("  Saved: IFALog.txt ({} entries)".format(len(log_list)))
+        
+        elapsed = time.time() - start_time
+        print("\nAggregation complete! ({:.2f}s)".format(elapsed))
+        print("="*80)
+
+    def get_system_memory_gb():
+        """Get total system memory in GB."""
         try:
-            # Python 2/3 compatibility for input
-            input_func = raw_input
-        except NameError:
-            input_func = input
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemTotal:'):
+                        # Format: MemTotal:       32768000 kB
+                        kb = int(line.split()[1])
+                        return kb / (1024 * 1024)  # Convert to GB
+        except:
+            pass
+        # Fallback: assume 16GB
+        return 16.0
+
+    def get_available_memory_gb():
+        """Get available system memory in GB."""
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        kb = int(line.split()[1])
+                        return kb / (1024 * 1024)
+        except:
+            pass
+        return get_system_memory_gb() * 0.8  # Assume 80% available
+
+    def measure_process_memory_gb(pid):
+        """Measure memory usage of a process and its children in GB."""
+        try:
+            # Use /proc/[pid]/status for VmRSS (Resident Set Size)
+            total_rss = 0
             
-        choice = input_func("Do you want to (d)ownload and setup Fiji, or (p)rovide a path? [d/p]: ")
-        
-        if choice.lower().startswith('p'):
-            path = input_func("Enter path to Fiji executable: ")
-            if os.path.exists(path):
-                fiji_path = os.path.abspath(path)
-            else:
-                print("Invalid path.")
-                sys.exit(1)
-        else:
-            fiji_path = setup_fiji()
+            # Get main process memory
+            status_file = '/proc/{}/status'.format(pid)
+            if os.path.exists(status_file):
+                with open(status_file, 'r') as f:
+                    for line in f:
+                        if line.startswith('VmRSS:'):
+                            total_rss += int(line.split()[1])  # kB
+                            break
             
-    # Save config
-    with open(CONFIG_FILE, 'w') as f:
-        f.write(fiji_path)
-        
-    print("Using Fiji at: {}".format(fiji_path))
-    
-    # Create a temporary launcher script to avoid parsing issues with large files in Jython
-    # This works around the "Mark invalid" / "encoding declaration" errors when running large scripts directly
-    import tempfile
-    
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    script_name = os.path.basename(__file__)
-    module_name = os.path.splitext(script_name)[0]
-    
-    # We embed the current arguments into the launcher so the module sees them
-    launcher_content = """
+            # Get children's memory
+            children_file = '/proc/{}/task/{}/children'.format(pid, pid)
+            if os.path.exists(children_file):
+                with open(children_file, 'r') as f:
+                    children = f.read().strip().split()
+                    for child_pid in children:
+                        child_status = '/proc/{}/status'.format(child_pid)
+                        if os.path.exists(child_status):
+                            with open(child_status, 'r') as cf:
+                                for line in cf:
+                                    if line.startswith('VmRSS:'):
+                                        total_rss += int(line.split()[1])
+                                        break
+            
+            return total_rss / (1024 * 1024)  # Convert to GB
+        except:
+            return 0
+
+    def get_peak_memory_from_proc(pid):
+        """Get peak memory (VmHWM - High Water Mark) for a process."""
+        try:
+            status_file = '/proc/{}/status'.format(pid)
+            if os.path.exists(status_file):
+                with open(status_file, 'r') as f:
+                    for line in f:
+                        if line.startswith('VmHWM:'):
+                            return int(line.split()[1]) / (1024 * 1024)  # GB
+        except:
+            pass
+        return 0
+
+    def create_launcher_file(script_dir, module_name, config_path, image_path, global_index):
+        """Create a temporary launcher script for single-image processing."""
+        launcher_content = '''
 import sys
 import os
 
-# Add the script directory to path so we can import the module
+script_dir = r"{script_dir}"
+if script_dir not in sys.path:
+    sys.path.append(script_dir)
+
+import {module} as Pynapse
+
+# Run in single-image mode with global image index
+sys.argv = ['Pynapse.py', '--single-image', r'{config_path}', r'{image_path}', '{global_index}']
+Pynapse.main()
+'''.format(script_dir=script_dir, module=module_name, 
+           config_path=config_path, image_path=image_path, global_index=global_index)
+        
+        fd, launcher_path = tempfile.mkstemp(suffix=".py", text=True)
+        with os.fdopen(fd, 'w') as f:
+            f.write(launcher_content)
+        return launcher_path
+
+    def run_per_image_mode(fiji_path, config_path, config):
+        """
+        Orchestrate per-image processing: launch a fresh Fiji for each image.
+        
+        Processing mode controlled by parallel_fiji setting:
+        - 'auto' (default): Auto-detect parallelism based on memory
+        - Integer (e.g., 4): Run exactly that many Fiji instances in parallel
+        - 1 or 'false' or '0': Sequential processing (one at a time)
+        """
+        source_dir = config.get('source_dir', '')
+        dest_dir = config.get('dest_dir', '')
+        parallel_fiji = config.get('parallel_fiji', 'auto')
+        
+        if not source_dir or not os.path.isdir(source_dir):
+            print("ERROR: Invalid source_dir: {}".format(source_dir))
+            sys.exit(1)
+        
+        if not dest_dir:
+            dest_dir = os.path.join(source_dir, 'Synapse_Output')
+        
+        # Create output directories
+        for folder in [dest_dir, os.path.join(dest_dir, 'merge'), 
+                       os.path.join(dest_dir, 'excel'), 
+                       os.path.join(dest_dir, '_intermediate')]:
+            if not os.path.exists(folder):
+                os.makedirs(folder)
+        
+        image_files = get_image_files(source_dir)
+        
+        print("="*80)
+        print("PYNAPSE - PER-IMAGE MODE")
+        print("="*80)
+        print("Source: {}".format(source_dir))
+        print("Destination: {}".format(dest_dir))
+        print("Found {} images to process".format(len(image_files)))
+        print("Parallel setting: {}".format(parallel_fiji))
+        print("="*80)
+        
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_name = os.path.basename(__file__)
+        module_name = os.path.splitext(script_name)[0]
+        
+        # All processing goes through run_parallel_mode which handles parallelism
+        successful, failed = run_parallel_mode(
+            fiji_path, config_path, config, image_files, 
+            script_dir, module_name, parallel_fiji
+        )
+        
+        print("\n" + "="*80)
+        print("IMAGE PROCESSING COMPLETE")
+        print("  Successful: {}".format(successful))
+        print("  Failed: {}".format(failed))
+        print("="*80)
+        
+        # Aggregate all intermediate results
+        aggregate_intermediate_results(dest_dir, config)
+        
+        print("\nAll done!")
+
+    def run_parallel_mode(fiji_path, config_path, config, image_files, script_dir, module_name, parallel_setting):
+        """
+        Parallel mode: Run multiple Fiji instances concurrently.
+        
+        If parallel_setting is 'auto' or True:
+          - Process first image alone to measure memory usage
+          - Calculate optimal parallelism with 30% safety buffer
+        If parallel_setting is an integer:
+          - Use that exact number of parallel processes
+        """
+        successful = 0
+        failed = 0
+        
+        # Determine parallelism
+        # Note: Must check for 'auto' string BEFORE checking == True, because 1 == True in Python
+        if parallel_setting == 'auto' or (parallel_setting is True) or parallel_setting == 'true':
+            # Auto-detect based on first image
+            parallel_count = auto_detect_parallelism(
+                fiji_path, config_path, image_files, script_dir, module_name
+            )
+            if parallel_count is None:
+                # First image failed during auto-detection
+                print("  [WARN] First image failed during auto-detection")
+                return 0, 1  # 0 successful, 1 failed
+            
+            # First image was already processed during detection
+            successful = 1
+            remaining_images = image_files[1:]
+            start_idx = 1
+        else:
+            # Fixed parallelism
+            try:
+                parallel_count = int(parallel_setting)
+            except:
+                parallel_count = 1
+            parallel_count = max(1, min(parallel_count, len(image_files)))
+            remaining_images = image_files
+            start_idx = 0
+        
+        # Ensure at least 1
+        parallel_count = max(1, parallel_count)
+        print("\nUsing {} parallel Fiji instance{}".format(parallel_count, 's' if parallel_count > 1 else ''))
+        
+        if parallel_count == 1:
+            # Single process, just continue sequentially
+            for i, image_path in enumerate(remaining_images):
+                idx = start_idx + i
+                image_name = os.path.basename(image_path)
+                print("\n[{}/{}] Processing: {}".format(idx+1, len(image_files), image_name))
+                
+                launcher_path = create_launcher_file(script_dir, module_name, config_path, image_path, idx)
+                try:
+                    cmd = [fiji_path, "--headless", "--run", launcher_path]
+                    result = subprocess.call(cmd)
+                    
+                    if result == 0:
+                        successful += 1
+                        print("  [OK] Completed successfully")
+                    else:
+                        failed += 1
+                        print("  [FAILED] Exit code: {}".format(result))
+                except Exception as e:
+                    failed += 1
+                    print("  [ERROR] {}".format(e))
+                finally:
+                    if os.path.exists(launcher_path):
+                        os.remove(launcher_path)
+        else:
+            # Process in batches
+            batch_num = 0
+            for batch_start in range(0, len(remaining_images), parallel_count):
+                batch_num += 1
+                batch_end = min(batch_start + parallel_count, len(remaining_images))
+                batch_images = remaining_images[batch_start:batch_end]
+                
+                print("\n" + "-"*60)
+                print("BATCH {}: Processing {} images in parallel".format(
+                    batch_num, len(batch_images)))
+                print("-"*60)
+                
+                # Start all processes in this batch
+                processes = []
+                for j, image_path in enumerate(batch_images):
+                    idx = start_idx + batch_start + j
+                    image_name = os.path.basename(image_path)
+                    print("  Starting [{}/{}]: {}".format(idx+1, len(image_files), image_name))
+                    
+                    launcher_path = create_launcher_file(script_dir, module_name, config_path, image_path, idx)
+                    cmd = [fiji_path, "--headless", "--run", launcher_path]
+                    process = subprocess.Popen(cmd)
+                    processes.append({
+                        'process': process,
+                        'launcher': launcher_path,
+                        'image': image_name,
+                        'idx': idx
+                    })
+                
+                # Wait for all processes in batch to complete
+                print("\n  Waiting for batch to complete...")
+                for p in processes:
+                    result = p['process'].wait()
+                    if result == 0:
+                        successful += 1
+                        print("  [OK] [{}/{}] {}".format(p['idx']+1, len(image_files), p['image']))
+                    else:
+                        failed += 1
+                        print("  [FAILED] [{}/{}] {} (exit code: {})".format(
+                            p['idx']+1, len(image_files), p['image'], result))
+                    
+                    # Cleanup launcher
+                    if os.path.exists(p['launcher']):
+                        try:
+                            os.remove(p['launcher'])
+                        except:
+                            pass
+        
+        return successful, failed
+
+    def auto_detect_parallelism(fiji_path, config_path, image_files, script_dir, module_name):
+        """
+        Process first image to measure memory usage, then calculate optimal parallelism.
+        Returns the number of parallel processes to use, or None if first image failed.
+        """
+        if len(image_files) == 0:
+            return 1
+        
+        first_image = image_files[0]
+        image_name = os.path.basename(first_image)
+        
+        print("\n[1/{}] Processing first image to measure resources: {}".format(
+            len(image_files), image_name))
+        
+        launcher_path = create_launcher_file(script_dir, module_name, config_path, first_image, 0)
+        
+        try:
+            cmd = [fiji_path, "--headless", "--run", launcher_path]
+            process = subprocess.Popen(cmd)
+            pid = process.pid
+            
+            # Monitor memory usage during processing
+            peak_memory_gb = 0
+            sample_count = 0
+            
+            while process.poll() is None:
+                # Sample memory every 2 seconds
+                time.sleep(2)
+                current_mem = measure_process_memory_gb(pid)
+                if current_mem > peak_memory_gb:
+                    peak_memory_gb = current_mem
+                sample_count += 1
+            
+            result = process.returncode
+            
+            if result != 0:
+                print("  [FAILED] First image failed with exit code: {}".format(result))
+                return None
+            
+            print("  [OK] Completed successfully")
+            
+            # Also check VmHWM (high water mark) for more accurate peak
+            hwm = get_peak_memory_from_proc(pid)
+            if hwm > peak_memory_gb:
+                peak_memory_gb = hwm
+            
+            # Get available system memory
+            available_memory = get_available_memory_gb()
+            total_memory = get_system_memory_gb()
+            
+            # Add 30% safety buffer
+            memory_per_image = peak_memory_gb * 1.3
+            
+            # Ensure minimum memory per instance (Fiji needs at least ~2GB)
+            memory_per_image = max(memory_per_image, 2.0)
+            
+            # Calculate parallelism
+            # Leave some memory for system (at least 4GB or 10% of total)
+            system_reserve = max(4.0, total_memory * 0.1)
+            usable_memory = available_memory - system_reserve
+            
+            parallel_count = max(1, int(usable_memory / memory_per_image))
+            
+            # Cap at number of remaining images
+            parallel_count = min(parallel_count, len(image_files) - 1) if len(image_files) > 1 else 1
+            
+            # Cap at 16 to avoid too many processes
+            parallel_count = min(parallel_count, 16)
+            
+            print("\n  Memory Analysis:")
+            print("    Peak memory per image: {:.2f} GB".format(peak_memory_gb))
+            print("    With 30% buffer: {:.2f} GB".format(memory_per_image))
+            print("    Available system memory: {:.2f} GB".format(available_memory))
+            print("    System reserve: {:.2f} GB".format(system_reserve))
+            print("    Calculated parallelism: {}".format(parallel_count))
+            
+            return max(1, parallel_count)
+            
+        except Exception as e:
+            print("  [ERROR] {}".format(e))
+            return None
+        finally:
+            if os.path.exists(launcher_path):
+                try:
+                    os.remove(launcher_path)
+                except:
+                    pass
+
+    def run_legacy_mode(fiji_path, config_path):
+        """
+        Run in legacy mode: single Fiji instance processes all images.
+        """
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_name = os.path.basename(__file__)
+        module_name = os.path.splitext(script_name)[0]
+        
+        launcher_content = """
+import sys
+import os
+
 script_dir = r"{}"
 if script_dir not in sys.path:
     sys.path.append(script_dir)
 
 import {} as Pynapse
 
-# Restore arguments
 sys.argv = {}
 
-# Run main
 Pynapse.main()
 """.format(script_dir, module_name, repr(sys.argv))
 
-    fd, launcher_path = tempfile.mkstemp(suffix=".py", text=True)
-    with os.fdopen(fd, 'w') as f:
-        f.write(launcher_content)
-    
-    # Re-launch with Fiji running the launcher
-    cmd = [fiji_path, "--headless", "--run", launcher_path]
-    
-    print("Launching via wrapper: " + " ".join(cmd))
-    sys.stdout.flush()
-    try:
-        subprocess.call(cmd)
-    finally:
-        if os.path.exists(launcher_path):
-            os.remove(launcher_path)
+        fd, launcher_path = tempfile.mkstemp(suffix=".py", text=True)
+        with os.fdopen(fd, 'w') as f:
+            f.write(launcher_content)
+        
+        cmd = [fiji_path, "--headless", "--run", launcher_path]
+        
+        print("Launching via wrapper: " + " ".join(cmd))
+        sys.stdout.flush()
+        try:
+            subprocess.call(cmd)
+        finally:
+            if os.path.exists(launcher_path):
+                os.remove(launcher_path)
+
+    # Main CPython entry point
+    def cpython_main():
+        fiji_path = get_fiji_path()
+        
+        if not fiji_path:
+            print("Fiji not found.")
+            try:
+                input_func = raw_input
+            except NameError:
+                input_func = input
+                
+            choice = input_func("Do you want to (d)ownload and setup Fiji, or (p)rovide a path? [d/p]: ")
             
-    sys.exit(0)
+            if choice.lower().startswith('p'):
+                path = input_func("Enter path to Fiji executable: ")
+                if os.path.exists(path):
+                    fiji_path = os.path.abspath(path)
+                else:
+                    print("Invalid path.")
+                    sys.exit(1)
+            else:
+                fiji_path = setup_fiji()
+                
+        # Save config
+        with open(CONFIG_FILE, 'w') as f:
+            f.write(fiji_path)
+            
+        print("Using Fiji at: {}".format(fiji_path))
+        
+        # Parse arguments
+        config_path = None
+        per_image_mode = True  # Default to memory-efficient mode
+        
+        args = sys.argv[1:]
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == '--legacy':
+                per_image_mode = False
+            elif arg == '--per-image':
+                per_image_mode = True
+            elif arg == '--single-image':
+                # This is handled in Jython, not here
+                pass
+            elif not arg.startswith('-'):
+                config_path = arg
+            i += 1
+        
+        if not config_path:
+            if 'SYNAPSEJ_CONFIG' in os.environ:
+                config_path = os.environ['SYNAPSEJ_CONFIG']
+        
+        if not config_path:
+            print("Usage: python Pynapse.py [--per-image|--legacy] <config_file>")
+            print("  --per-image : Process each image in a fresh Fiji instance (default, memory efficient)")
+            print("  --legacy    : Process all images in a single Fiji instance (faster but uses more memory)")
+            sys.exit(1)
+        
+        if per_image_mode:
+            config = parse_config_file(config_path)
+            run_per_image_mode(fiji_path, config_path, config)
+        else:
+            run_legacy_mode(fiji_path, config_path)
+        
+        sys.exit(0)
+
+    # Run CPython main
+    cpython_main()
 
 # --- JYTHON IMPORTS (Only execute if running in Fiji) ---
 if is_jython():
@@ -291,6 +1108,22 @@ def default_config():
         # This means if images have different pixel sizes, the wrong calibration is used.
         # Set this to True to replicate the original broken behavior for exact macro matching.
         'use_original_broken_global_calibration': False,
+        
+        # --- Bug Replication Options ---
+        # The original SynapseJ macro has a bug in CollateResults: it only copies 17 fields
+        # (Label through MinFeret) for images after the first, causing MinThr/MaxThr to be 0.
+        # Set this to True to replicate that behavior for exact 1:1 macro matching.
+        # Default is False (correct behavior - preserve thresholds for all images).
+        'replicate_threshold_bug': False,
+        
+        # --- Performance Options ---
+        # parallel_fiji: Run multiple Fiji instances in parallel.
+        # - 'auto' (default): Automatically determine parallelism based on first image's memory usage
+        # - Integer (e.g., 4): Run exactly that many Fiji instances in parallel
+        # - 1, '1', 'false', or '0': Sequential processing (one at a time)
+        # When 'auto', the first image is processed alone to measure memory usage,
+        # then remaining images are batched with a 30% safety buffer.
+        'parallel_fiji': 'auto',
     }
 
 
@@ -521,8 +1354,8 @@ class SynapseJ4ChannelComplete(object):
         self.log_messages = []
         
         # Image counter for tracking first vs subsequent images.
-        # This is used to replicate the og2 macro bug where MinThr/MaxThr
-        # are only preserved for the first image's Syn Results.
+        # Used when 'replicate_threshold_bug' is enabled to zero out MinThr/MaxThr
+        # for images after the first one (matching og2 macro bug).
         self._image_index = 0
 
         # Load configuration: Start with defaults, then override with file if provided.
@@ -1283,12 +2116,11 @@ class SynapseJ4ChannelComplete(object):
             # Use pre_roi_index_map to preserve original indices from PreALLRoiSet
             self.save_roi_set(syn_pre_rois, os.path.join(self.dest_dir, '{}PreSYNRoiSet.zip'.format(name_short)), pre_result_imp, pre_roi_index_map)
             
-            # MACRO BUG REPLICATION: In og2, the CollateResults function only copies 17 fields
-            # (Label through MinFeret) and doesn't include MinThr/MaxThr. This means:
-            # - First image: thresholds are preserved (Results table renamed directly)
-            # - Subsequent images: MinThr=0, MaxThr=0 (fields not copied)
-            # Apply AFTER saving per-image files (which should have correct thresholds)
-            if self._image_index > 0:
+            # MACRO BUG REPLICATION (optional): In og2, the CollateResults function only copies 17 fields
+            # (Label through MinFeret) for images after the first, causing MinThr/MaxThr to be 0.
+            # This behavior is controlled by 'replicate_threshold_bug' config (default: False).
+            # Apply AFTER saving per-image files (which always have correct thresholds).
+            if self.config.get('replicate_threshold_bug', False) and self._image_index > 0:
                 for row in syn_pre_rows:
                     row['MinThr'] = 0
                     row['MaxThr'] = 0
@@ -1302,8 +2134,8 @@ class SynapseJ4ChannelComplete(object):
             # Use post_roi_index_map to preserve original indices from PostALLRoiSet
             self.save_roi_set(syn_post_rois, os.path.join(self.dest_dir, '{}PostSYNRoiSet.zip'.format(name_short)), post_result_imp, post_roi_index_map)
             
-            # MACRO BUG REPLICATION: Same as above for post-synaptic results.
-            if self._image_index > 0:
+            # MACRO BUG REPLICATION (optional): Same as above for post-synaptic results.
+            if self.config.get('replicate_threshold_bug', False) and self._image_index > 0:
                 for row in syn_post_rows:
                     row['MinThr'] = 0
                     row['MaxThr'] = 0
@@ -2701,6 +3533,110 @@ class SynapseJ4ChannelComplete(object):
         with open(path, 'w') as handle:
             handle.write('\n'.join(self.log_messages))
 
+    def save_intermediate_results(self, image_name):
+        """
+        Save intermediate results for a single image to JSON.
+        
+        This is used in per-image mode where each image is processed in a
+        separate Fiji instance. The intermediate JSON files are later
+        aggregated by CPython.
+        
+        Args:
+            image_name (str): Base name of the image (without extension).
+        """
+        intermediate_dir = os.path.join(self.dest_dir, '_intermediate')
+        if not os.path.exists(intermediate_dir):
+            os.makedirs(intermediate_dir)
+        
+        # Convert OrderedDicts to regular dicts for JSON serialization
+        def to_serializable(obj):
+            if isinstance(obj, OrderedDict):
+                return dict(obj)
+            elif isinstance(obj, dict):
+                return {k: to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [to_serializable(item) for item in obj]
+            else:
+                return obj
+        
+        # Prepare data for JSON serialization
+        data = {
+            'image_name': image_name,
+            'results_summary': to_serializable(self.results_summary),
+            'all_pre_results': to_serializable(self.all_pre_results),
+            'all_post_results': to_serializable(self.all_post_results),
+            'syn_pre_results': to_serializable(self.syn_pre_results),
+            'syn_post_results': to_serializable(self.syn_post_results),
+            # Skip header row from correlation rows (starts with "Image Name")
+            'pre_correlation_rows': [r for r in self.pre_correlation_rows if not r.startswith('Image Name')],
+            'post_correlation_rows': [r for r in self.post_correlation_rows if not r.startswith('Image Name')],
+            'batch_synapse_rows': to_serializable(self.batch_synapse_rows),
+            'log_messages': self.log_messages,
+        }
+        
+        # Save to JSON file
+        json_path = os.path.join(intermediate_dir, '{}.json'.format(image_name))
+        with open(json_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        self.log("Saved intermediate results to: {}".format(json_path))
+
+    def process_single_image(self, image_path):
+        """
+        Process a single image and save intermediate results.
+        
+        This is the entry point for per-image mode. It:
+        1. Sets up output directories
+        2. Processes the image
+        3. Saves intermediate JSON results for later aggregation
+        
+        Args:
+            image_path (str): Full path to the image file.
+        """
+        # Validate source file
+        if not os.path.exists(image_path):
+            self.log('ERROR: Image file does not exist: {}'.format(image_path))
+            return
+        
+        name_short = os.path.splitext(os.path.basename(image_path))[0]
+        
+        # Set default destination if not provided
+        if not self.dest_dir:
+            self.dest_dir = os.path.join(os.path.dirname(image_path), 'Synapse_Output')
+        
+        # Define subdirectories
+        self.merge_dir = os.path.join(self.dest_dir, 'merge')
+        self.excel_dir = os.path.join(self.dest_dir, 'excel')
+        
+        # Create output directories if needed
+        for folder in [self.dest_dir, self.merge_dir, self.excel_dir]:
+            if not os.path.exists(folder):
+                try:
+                    os.makedirs(folder)
+                except Exception as e:
+                    try:
+                        from java.io import File
+                        jfile = File(folder)
+                        jfile.mkdirs()
+                    except:
+                        pass
+        
+        # Log configuration
+        self.log_configuration_summary()
+        
+        # Process the image
+        try:
+            self.process_image(image_path)
+        except (Exception, Throwable) as exc:
+            import traceback
+            self.log('ERROR processing {}: {}'.format(image_path, exc))
+            traceback.print_exc()
+        
+        # Save intermediate results for aggregation
+        self.save_intermediate_results(name_short)
+        
+        self.log('Single image processing complete: {}'.format(name_short))
+
     def _pixel_area(self, cal):
         """
         Calculate the area of a single pixel in square microns.
@@ -2878,10 +3814,11 @@ class SynapseJ4ChannelComplete(object):
                             else:
                                 # Strategy 2: Strict Pixel Count Check
                                 # Check histogram for sufficient overlap with a single particle.
-                                # hist[0] is background (0).
-                                # hist[k] is the count of pixels belonging to partner particle ID k.
-                                for k in range(1, len(hist)):
-                                    if hist[k] >= overlap_pixels:
+                                # histogram[0] is background (0).
+                                # histogram[k] is the count of pixels belonging to partner particle ID k.
+                                histogram = stats.histogram
+                                for k in range(1, len(histogram)):
+                                    if histogram[k] >= overlap_pixels:
                                         should_keep = True
                                         break
                         
@@ -4322,43 +5259,80 @@ class ParallelUtils(object):
 def main():
     # --- Main Execution Entry Point ---
     # This block is executed only when the script is run directly (not imported as a module).
+    #
+    # Supports two modes:
+    # 1. Single-image mode: --single-image <config_path> <image_path> [global_index]
+    #    Processes one image and saves intermediate JSON for later aggregation.
+    #    global_index is optional; used for threshold bug replication (0 = first image).
+    # 2. Directory mode (legacy): <config_path>
+    #    Processes all images in a directory within a single Fiji instance.
     
-    # 1. Determine Configuration Path
-    #    The script requires a configuration file to know where the images are and what parameters to use.
-    #    We check command line arguments first, then environment variables.
-    config_path = None
-    if len(sys.argv) > 1:
-        # If an argument is provided, assume it is the path to the config file.
-        config_path = sys.argv[1]
-    elif 'SYNAPSEJ_CONFIG' in os.environ:
-        # Fallback to environment variable if no argument is provided.
-        config_path = os.environ['SYNAPSEJ_CONFIG']
-
-    # If no configuration is found, print usage instructions and exit.
-    if not config_path:
-        print('Usage: SYNAPSEJ_CONFIG=path/to/config fiji --headless --run Pynapse.py')
-        # Exit with error code 1.
-        System.exit(1)
-
-    try:
-        print("Starting Pynapse with config: {}".format(config_path))
-        # 2. Initialize Analyzer
-        #    Create an instance of the main class. This parses the config file,
-        #    validates parameters, and sets up the output directory structure.
-        analyzer = SynapseJ4ChannelComplete(config_path)
+    # Check for single-image mode
+    single_image_mode = '--single-image' in sys.argv
+    
+    if single_image_mode:
+        # Single-image mode: --single-image <config_path> <image_path> [global_index]
+        # Parse arguments
+        try:
+            idx = sys.argv.index('--single-image')
+            config_path = sys.argv[idx + 1]
+            image_path = sys.argv[idx + 2]
+            # Optional: global image index for threshold bug replication
+            global_index = int(sys.argv[idx + 3]) if len(sys.argv) > idx + 3 else 0
+        except (IndexError, ValueError):
+            print('Usage (single-image): fiji --headless --run Pynapse.py -- --single-image <config_path> <image_path> [global_index]')
+            System.exit(1)
         
-        # 3. Run Analysis
-        #    Start the batch processing loop. This iterates through all images 
-        #    in the input directory defined in the config and processes them one by one.
-        analyzer.process_directory()
-    finally:
-        # 4. Cleanup
-        #    Ensure the thread pool is shut down properly.
-        #    If we don't do this, the JVM might keep running because of the active threads in the pool.
-        ParallelUtils.shutdown()
-        
-        # Force exit with success code 0.
-        System.exit(0)
+        try:
+            print("Pynapse single-image mode: {}".format(os.path.basename(image_path)))
+            print("Config: {}".format(config_path))
+            
+            # Initialize analyzer
+            analyzer = SynapseJ4ChannelComplete(config_path)
+            
+            # Set the global image index for threshold bug replication
+            analyzer._image_index = global_index
+            
+            # Process single image and save intermediate results
+            analyzer.process_single_image(image_path)
+            
+        except (Exception, Throwable) as exc:
+            import traceback
+            print("ERROR in single-image mode: {}".format(exc))
+            traceback.print_exc()
+            System.exit(1)
+        finally:
+            # Cleanup
+            ParallelUtils.shutdown()
+            System.exit(0)
+    
+    else:
+        # Directory mode (legacy): process all images in single JVM
+        config_path = None
+        if len(sys.argv) > 1:
+            # If an argument is provided, assume it is the path to the config file.
+            config_path = sys.argv[1]
+        elif 'SYNAPSEJ_CONFIG' in os.environ:
+            # Fallback to environment variable if no argument is provided.
+            config_path = os.environ['SYNAPSEJ_CONFIG']
+
+        # If no configuration is found, print usage instructions and exit.
+        if not config_path:
+            print('Usage: SYNAPSEJ_CONFIG=path/to/config fiji --headless --run Pynapse.py')
+            print('   or: fiji --headless --run Pynapse.py -- --single-image <config_path> <image_path>')
+            System.exit(1)
+
+        try:
+            print("Starting Pynapse with config: {}".format(config_path))
+            # Initialize Analyzer
+            analyzer = SynapseJ4ChannelComplete(config_path)
+            
+            # Run Analysis (processes all images in directory)
+            analyzer.process_directory()
+        finally:
+            # Cleanup
+            ParallelUtils.shutdown()
+            System.exit(0)
 
 if __name__ == '__main__':
     main()
