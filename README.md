@@ -40,7 +40,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 cd pynapse
 
 # With uv (creates virtual environment automatically)
-uv sync
+uv sync --index-url https://pypi.org/simple
 
 # Or with pip
 pip install numpy pandas pillow
