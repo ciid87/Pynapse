@@ -43,7 +43,7 @@ cd pynapse
 uv sync --index-url https://pypi.org/simple
 
 # Or with pip
-pip install numpy pandas pillow
+uv pip install numpy pandas pillow
 ```
 
 ## Quick Start
@@ -89,6 +89,7 @@ Compare your output against a reference dataset:
 uv run python validate_pynapse.py /path/to/output /path/to/reference
 
 # Or with pip-installed dependencies
+source .venv/bin/activate
 python validate_pynapse.py /path/to/output /path/to/reference
 ```
 
