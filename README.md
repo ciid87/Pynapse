@@ -100,6 +100,28 @@ pre_min=658
 post_min=578
 ```
 
+### Channel configuration
+
+Pynapse supports 2-, 3-, and 4-channel images without requiring placeholder channels:
+
+- **2 channels:** pre- and postsynaptic puncta detection and overlap analysis.
+- **3 channels:** pre- and postsynaptic detection with one optional marker channel for gating.
+- **4 channels:** pre- and postsynaptic detection with up to two optional marker channels.
+
+Channel assignments are **1-indexed** and refer to the channel order in the input image. Set unused roles explicitly to `0`; omitted settings retain their default values. Each active role must use a distinct channel. For example, for a two-channel image containing presynaptic staining in C1 and postsynaptic staining in C2:
+
+```ini
+pre_channel=1
+post_channel=2
+pre_marker_channel=0
+post_marker_channel=0
+```
+
+For a three-channel image with an additional presynaptic gating marker in C3, set `pre_marker_channel=3` and configure its marker thresholds. Use `post_marker_channel=3` instead for a postsynaptic gating marker.
+
+Unused image channels do not need to be assigned. After exporting a subset of channels in Fiji, update the assignments to match the exported image's channel numbering. Ensure the image dimensions correctly distinguish channels from Z slices.
+
+Single-channel puncta-only analysis is also supported: enable either `pre_channel` or `post_channel` and set the other primary role and unused marker roles to `0`. Synapse overlap analysis requires both primary roles.
 
 ### 2. Run Pynapse
 

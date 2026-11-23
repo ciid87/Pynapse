@@ -442,15 +442,15 @@ if not is_jython():
         # === Write Collated ResultsIF ===
         if results_summary_dfs:
             df = pl.concat(results_summary_dfs, how='diagonal')
-            n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'Collated ResultsIF.txt'), SUMMARY_COLUMNS)
-            print("  Saved: Collated ResultsIF.txt ({} rows)".format(n))
+            n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'Collated ResultsIF.tsv'), SUMMARY_COLUMNS)
+            print("  Saved: Collated ResultsIF.tsv ({} rows)".format(n))
         
         # === Write All Pre Results (with simplified labels) ===
         if all_pre_dfs:
             df = pl.concat(all_pre_dfs, how='diagonal')
             df = simplify_labels_vectorized(df)
-            n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'All Pre Results.txt'), ALL_RESULTS_COLUMNS, first_image_label=first_image_label)
-            print("  Saved: All Pre Results.txt ({} rows)".format(n))
+            n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'All Pre Results.tsv'), ALL_RESULTS_COLUMNS, first_image_label=first_image_label)
+            print("  Saved: All Pre Results.tsv ({} rows)".format(n))
         
         # === Write All Post Results (with simplified labels) ===
         if all_post_dfs:
@@ -461,36 +461,36 @@ if not is_jython():
             if all_post_flat:
                 df = pl.DataFrame(all_post_flat)
                 df = simplify_labels_vectorized(df)
-                n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'All Post Results.txt'), ALL_RESULTS_COLUMNS, first_image_label=first_image_label)
-                print("  Saved: All Post Results.txt ({} rows)".format(n))
+                n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'All Post Results.tsv'), ALL_RESULTS_COLUMNS, first_image_label=first_image_label)
+                print("  Saved: All Post Results.tsv ({} rows)".format(n))
         
         # === Write Syn Pre Results ===
         if syn_pre_dfs:
             df = pl.concat(syn_pre_dfs, how='diagonal')
-            n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'Syn Pre Results.txt'), SYN_RESULTS_COLUMNS, first_image_label=first_image_label)
-            print("  Saved: Syn Pre Results.txt ({} rows)".format(n))
+            n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'Syn Pre Results.tsv'), SYN_RESULTS_COLUMNS, first_image_label=first_image_label)
+            print("  Saved: Syn Pre Results.tsv ({} rows)".format(n))
         
         # === Write Syn Post Results ===
         if syn_post_dfs:
             df = pl.concat(syn_post_dfs, how='diagonal')
-            n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'Syn Post Results.txt'), SYN_RESULTS_COLUMNS, first_image_label=first_image_label)
-            print("  Saved: Syn Post Results.txt ({} rows)".format(n))
+            n = write_tsv_with_row_numbers(df, os.path.join(dest_dir, 'Syn Post Results.tsv'), SYN_RESULTS_COLUMNS, first_image_label=first_image_label)
+            print("  Saved: Syn Post Results.tsv ({} rows)".format(n))
         
         # === Write correlation results (pre-formatted TSV strings) ===
         CORR_HEADER = "Image Name\tArea\tMean\tMin\tMax\tX\tY\tXM\tYM\tPerim.\tFeret\tIntDen\tRawIntDen\tFeretX\tFeretY\tFeretAngle\tMinFeret\tImage Name\tArea\tMean\tMin\tMax\tX\tY\tXM\tYM\tPerim.\tFeret\tIntDen\tRawIntDen\tFeretX\tFeretY\tFeretAngle\tMinFeret\tNo. of Post/Pre Puncta \tPost IntDen\tPostsynaptic Puncta No.\tOverlap\tDistance\tDistance M"
         CORR_HEADER2 = CORR_HEADER.replace('Post/Pre', 'Pre/Post').replace('Post IntDen', 'Pre IntDen').replace('Postsynaptic', 'Presynaptic')
         
         if pre_corr_list:
-            with open(os.path.join(dest_dir, 'CorrResults.txt'), 'w') as f:
+            with open(os.path.join(dest_dir, 'CorrResults.tsv'), 'w') as f:
                 f.write(CORR_HEADER + '\n')
                 f.write('\n'.join(pre_corr_list) + '\n')
-            print("  Saved: CorrResults.txt ({} rows)".format(len(pre_corr_list)))
+            print("  Saved: CorrResults.tsv ({} rows)".format(len(pre_corr_list)))
         
         if post_corr_list:
-            with open(os.path.join(dest_dir, 'CorrResults2.txt'), 'w') as f:
+            with open(os.path.join(dest_dir, 'CorrResults2.tsv'), 'w') as f:
                 f.write(CORR_HEADER2 + '\n')
                 f.write('\n'.join(post_corr_list) + '\n')
-            print("  Saved: CorrResults2.txt ({} rows)".format(len(post_corr_list)))
+            print("  Saved: CorrResults2.tsv ({} rows)".format(len(post_corr_list)))
         
         # === Write batch synapse report ===
         present_dir = os.path.join(dest_dir, 'present')
@@ -629,7 +629,7 @@ Pynapse.main()
         
         # Create output directories
         for folder in [dest_dir, os.path.join(dest_dir, 'merge'), 
-                       os.path.join(dest_dir, 'excel'), 
+                       os.path.join(dest_dir, 'result_tables'), 
                        os.path.join(dest_dir, '_intermediate')]:
             if not os.path.exists(folder):
                 os.makedirs(folder)
@@ -1239,7 +1239,7 @@ class SynapseJ4ChannelComplete(object):
         
         This is used by "Set Measurements... decimal=3" which outputs exactly 3 decimal 
         places for float values (no stripping of trailing zeros).
-        Used for Pre.txt, Post.txt, and Syn Results files.
+        Used for Pre.tsv, Post.tsv, and Syn Results files.
         """
         if val is None:
             return ''
@@ -1549,34 +1549,35 @@ class SynapseJ4ChannelComplete(object):
         # This log output is critical for reproducibility. It records the exact parameters
         # used for the analysis, allowing researchers to verify settings later.
         
-        # Pre-synaptic channel summary
-        self.log('Measuring Presynaptic marker C{} channel at noise {} above {} bigger than {} and smaller than {}'.
-                 format(self.pre_channel,
-                        int(self.pre_params['noise']),
-                        int(self.pre_params['min']),
-                        self.pre_params['size_low'],
-                        self.pre_params['size_high']))
-        if self.pre_params['blur']:
-            self.log('Presynaptic puncta are median blurred {} pixels'.format(int(self.pre_params['blur_radius'])))
-        else:
-            self.log('Presynaptic puncta are not blurred')
-        if self.pre_params['background'] > 0:
-            self.log('Background removed with a pixel radius of {}'.format(int(self.pre_params['background'])))
-        else:
-            self.log('Background is not removed')
-        if self.pre_params['apply_fade'] and self.pre_params['fade_factors']:
-            self.log('Correcting fading of presynaptic signal:')
-            for factor in self.pre_params['fade_factors']:
-                self.log(str(factor))
-        else:
-            self.log('Presynaptic signal is not faded')
+        if self.pre_channel:
+            # Pre-synaptic channel summary
+            self.log('Measuring Presynaptic marker C{} channel at noise {} above {} bigger than {} and smaller than {}'.
+                     format(self.pre_channel,
+                            int(self.pre_params['noise']),
+                            int(self.pre_params['min']),
+                            self.pre_params['size_low'],
+                            self.pre_params['size_high']))
+            if self.pre_params['blur']:
+                self.log('Presynaptic puncta are median blurred {} pixels'.format(int(self.pre_params['blur_radius'])))
+            else:
+                self.log('Presynaptic puncta are not blurred')
+            if self.pre_params['background'] > 0:
+                self.log('Background removed with a pixel radius of {}'.format(int(self.pre_params['background'])))
+            else:
+                self.log('Background is not removed')
+            if self.pre_params['apply_fade'] and self.pre_params['fade_factors']:
+                self.log('Correcting fading of presynaptic signal:')
+                for factor in self.pre_params['fade_factors']:
+                    self.log(str(factor))
+            else:
+                self.log('Presynaptic signal is not faded')
 
-        if self.pre_params['use_maxima']:
-            self.log("Using 'Find Maxima' to find presynaptic puncta in a dense image.")
-        else:
-            self.log("Just using Threshold to find presynaptic puncta in a sparse image.")
+            if self.pre_params['use_maxima']:
+                self.log("Using 'Find Maxima' to find presynaptic puncta in a dense image.")
+            else:
+                self.log("Just using Threshold to find presynaptic puncta in a sparse image.")
 
-        if self.pre_marker_thresholds:
+        if self.pre_marker_channel and self.pre_marker_thresholds:
             thr_lo = int(self.pre_marker_thresholds['min'])
             thr_hi = int(self.pre_marker_thresholds['max'])
             thr_sz = int(self.pre_marker_thresholds['size'])
@@ -1586,34 +1587,35 @@ class SynapseJ4ChannelComplete(object):
         else:
             self.log("No third marker channel.")
 
-        # Post-synaptic channel summary
-        self.log('Measuring Postsynaptic marker C{} channel at noise {} above {} bigger than {} and smaller than {}'.
-                 format(self.post_channel,
-                        int(self.post_params['noise']),
-                        int(self.post_params['min']),
-                        self.post_params['size_low'],
-                        self.post_params['size_high']))
-        if self.post_params['blur']:
-            self.log('Postsynaptic puncta are median blurred {} pixels'.format(int(self.post_params['blur_radius'])))
-        else:
-            self.log('Postsynaptic puncta are not blurred')
-        if self.post_params['background'] > 0:
-            self.log('Background removed with a pixel radius of {}'.format(int(self.post_params['background'])))
-        else:
-            self.log('Background is not removed')
-        if self.post_params['apply_fade'] and self.post_params['fade_factors']:
-            self.log('Correcting fading of postsynaptic signal:')
-            for factor in self.post_params['fade_factors']:
-                self.log(str(factor))
-        else:
-            self.log('Postsynaptic signal is not faded')
+        if self.post_channel:
+            # Post-synaptic channel summary
+            self.log('Measuring Postsynaptic marker C{} channel at noise {} above {} bigger than {} and smaller than {}'.
+                     format(self.post_channel,
+                            int(self.post_params['noise']),
+                            int(self.post_params['min']),
+                            self.post_params['size_low'],
+                            self.post_params['size_high']))
+            if self.post_params['blur']:
+                self.log('Postsynaptic puncta are median blurred {} pixels'.format(int(self.post_params['blur_radius'])))
+            else:
+                self.log('Postsynaptic puncta are not blurred')
+            if self.post_params['background'] > 0:
+                self.log('Background removed with a pixel radius of {}'.format(int(self.post_params['background'])))
+            else:
+                self.log('Background is not removed')
+            if self.post_params['apply_fade'] and self.post_params['fade_factors']:
+                self.log('Correcting fading of postsynaptic signal:')
+                for factor in self.post_params['fade_factors']:
+                    self.log(str(factor))
+            else:
+                self.log('Postsynaptic signal is not faded')
 
-        if self.post_params['use_maxima']:
-            self.log("Using 'Find Maxima' to find postsynaptic puncta in a dense image.")
-        else:
-            self.log("Just using Threshold to find postsynaptic puncta in a sparse image.")
+            if self.post_params['use_maxima']:
+                self.log("Using 'Find Maxima' to find postsynaptic puncta in a dense image.")
+            else:
+                self.log("Just using Threshold to find postsynaptic puncta in a sparse image.")
 
-        if self.post_marker_thresholds:
+        if self.post_marker_channel and self.post_marker_thresholds:
             for_lo = int(self.post_marker_thresholds['min'])
             for_hi = int(self.post_marker_thresholds['max'])
             for_sz = int(self.post_marker_thresholds['size'])
@@ -1772,7 +1774,7 @@ class SynapseJ4ChannelComplete(object):
             
         # Define subdirectories for organized output.
         self.merge_dir = os.path.join(self.dest_dir, 'merge')
-        self.excel_dir = os.path.join(self.dest_dir, 'excel')
+        self.excel_dir = os.path.join(self.dest_dir, 'result_tables')
         
         # Create output directories if they don't exist.
         # Use Java File API as fallback since os.makedirs can silently fail in some Jython environments
@@ -1864,32 +1866,35 @@ class SynapseJ4ChannelComplete(object):
             
         name_short = os.path.splitext(os.path.basename(image_path))[0]
         
-        # Extract original slice labels before splitting channels.
-        # These are needed for proper label formatting in results tables.
-        # Original image has (channels * z-slices) total slices.
-        # After split, each channel stack has z-slices.
-        # For channel C, z-slice Z: original_slice = (Z-1) * n_channels + C
-        original_slice_labels = {}
-        n_channels = imp.getNChannels() if imp.getNChannels() > 1 else len(imp.getStack()) // imp.getNSlices() if imp.getNSlices() > 1 else 4
+        # ImageJ hyperstack dimensions distinguish a one-channel Z stack from channels.
+        n_ch = imp.getNChannels()
+        roles = [('pre', self.pre_channel), ('post', self.post_channel),
+                 ('pre_marker', self.pre_marker_channel), ('post_marker', self.post_marker_channel)]
+        active = [number for role, number in roles if number]
+        if not (self.pre_channel or self.post_channel):
+            raise ValueError('Select at least one primary channel (pre or post)')
+        for role, number in roles:
+            if not 0 <= number <= n_ch:
+                raise ValueError('{}: {}={} outside 0..{}'.format(name_short, role, number, n_ch))
+        if len(set(active)) != len(active):
+            raise ValueError('Each active role requires a distinct staining channel')
+        if ((self.pre_marker_channel and not self.pre_channel) or
+                (self.post_marker_channel and not self.post_channel)):
+            raise ValueError('A marker requires its corresponding primary channel')
+        self.log('Channel roles: ' + ', '.join('{}={}'.format(r, 'C{}'.format(n) if n else 'off')
+                                               for r, n in roles))
         stack = imp.getStack()
-        for i in range(stack.getSize()):
-            label = stack.getSliceLabel(i + 1)
-            original_slice_labels[i + 1] = label if label else ''
-        
-        # Split the multi-channel image into individual ImagePlus objects.
-        # Note: ChannelSplitter returns an array of ImagePlus.
-        channels = ChannelSplitter.split(imp)
-        
-        # Duplicate channels for processing to avoid modifying the originals or causing thread conflicts.
-        # We need separate copies for segmentation (detection) and measurement (intensity quantification).
-        # Adjust indices to 0-based (User config is 1-based).
-        pre_src = channels[self.pre_channel - 1].duplicate()
-        post_src = channels[self.post_channel - 1].duplicate()
-        
-        pre_seg = pre_src.duplicate()      # For segmentation (Find Maxima/Threshold)
-        post_seg = post_src.duplicate()    # For segmentation
-        pre_measure = pre_src.duplicate()  # For intensity measurement
-        post_measure = post_src.duplicate()# For intensity measurement
+        original_slice_labels = {i: stack.getSliceLabel(i) or ''
+                                 for i in range(1, stack.getSize() + 1)}
+        channels = ChannelSplitter.split(imp) if n_ch > 1 else [imp]
+        def primary_images(number):
+            if not number:
+                return None, None
+            source = channels[number - 1]
+            return source.duplicate(), source.duplicate()
+
+        pre_seg, pre_measure = primary_images(self.pre_channel)
+        post_seg, post_measure = primary_images(self.post_channel)
 
         cal = imp.getCalibration()
         # Note: We rely on the image's embedded calibration. If missing, ImageJ defaults to pixels.
@@ -1900,7 +1905,7 @@ class SynapseJ4ChannelComplete(object):
                 # First image: store its calibration for all subsequent images
                 self.global_calibration = cal.copy()
                 self.log('DEBUG: Using GLOBAL calibration mode (original macro bug). First image calibration saved.')
-                self.log('DEBUG: Global calibration: pixelWidth={}, unit={}'.format(cal.pixelWidth, cal.getUnit()))
+                self.log('DEBUG: Global calibration: pixelWidth={}, unit={}'.format(cal.pixelWidth, cal.getUnit().encode('utf-8')))
             else:
                 # Subsequent images: use the first image's calibration
                 cal = self.global_calibration
@@ -1910,8 +1915,6 @@ class SynapseJ4ChannelComplete(object):
         # This speeds up analysis significantly on multi-core systems.
         # Build slice label lookup functions for each channel.
         # For channel C, z-slice Z: original_slice = (Z-1) * n_channels + C
-        n_ch = imp.getNChannels() if imp.getNChannels() > 1 else 4  # fallback to 4 if not detected
-        
         def get_pre_slice_label(z_slice):
             """Get original slice label for Pre channel (channel self.pre_channel) at z-slice."""
             orig_slice = (z_slice - 1) * n_ch + self.pre_channel
@@ -1932,17 +1935,17 @@ class SynapseJ4ChannelComplete(object):
             
         # Execute detection in parallel.
         # This is safe because we are operating on independent ImagePlus objects.
-        results = ParallelUtils.run_tasks([run_pre, run_post])
-        
-        # Unpack results:
-        # entries: List of dictionaries containing ROI and metrics for every detected puncta.
-        # result_imp: The processed image (background subtracted, etc.) used for detection.
-        # mask_imp: The binary mask of detected puncta.
-        pre_entries, pre_result_imp, pre_mask_imp = results[0]
-        post_entries, post_result_imp, post_mask_imp = results[1]
-
-        self.log('  Pre detections (pre-marker): {}'.format(len(pre_entries)))
-        self.log('  Post detections (post-marker): {}'.format(len(post_entries)))
+        if self.pre_channel and self.post_channel:
+            pre, post = ParallelUtils.run_tasks([run_pre, run_post])
+        else:
+            pre = run_pre() if self.pre_channel else ([], None, None)
+            post = run_post() if self.post_channel else ([], None, None)
+        pre_entries, pre_result_imp, pre_mask_imp = pre
+        post_entries, post_result_imp, post_mask_imp = post
+        if self.pre_channel:
+            self.log('  Pre detections (pre-marker): {}'.format(len(pre_entries)))
+        if self.post_channel:
+            self.log('  Post detections (pre-marker): {}'.format(len(post_entries)))
 
         pre_marker_count = 0
         post_marker_count = 0
@@ -1952,9 +1955,9 @@ class SynapseJ4ChannelComplete(object):
         post_count_total = len(post_entries)
 
         # ==========================================================================
-        # IMPORTANT: Save Pre.txt and Post.txt BEFORE marker gating!
+        # IMPORTANT: Save Pre.tsv and Post.tsv BEFORE marker gating!
         # SynapseJ saves Results after PrepChannel but BEFORE CoLocROI marker gating.
-        # The Pre.txt/Post.txt files contain ALL detected puncta (before filtering).
+        # The Pre.tsv/Post.tsv files contain ALL detected puncta (before filtering).
         # ==========================================================================
         all_pre_rows = [entry['metrics'] for entry in pre_entries]
         all_post_rows = [entry['metrics'] for entry in post_entries]
@@ -1965,11 +1968,11 @@ class SynapseJ4ChannelComplete(object):
         
         if all_pre_rows:
             self.all_pre_results.extend(all_pre_rows)
-            self.save_results_table(self._filter_all_results_metrics(all_pre_rows), os.path.join(self.dest_dir, '{}Pre.txt'.format(name_short)))
+            self.save_results_table(self._filter_all_results_metrics(all_pre_rows), os.path.join(self.dest_dir, '{}Pre.tsv'.format(name_short)))
             pre_roi_index_map = self.save_roi_set([entry['roi'] for entry in pre_entries], os.path.join(self.dest_dir, '{}PreALLRoiSet.zip'.format(name_short)), pre_result_imp)
         if all_post_rows:
             self.all_post_results.extend(all_post_rows)
-            self.save_results_table(self._filter_all_results_metrics(all_post_rows), os.path.join(self.dest_dir, '{}Post.txt'.format(name_short)))
+            self.save_results_table(self._filter_all_results_metrics(all_post_rows), os.path.join(self.dest_dir, '{}Post.tsv'.format(name_short)))
             post_roi_index_map = self.save_roi_set([entry['roi'] for entry in post_entries], os.path.join(self.dest_dir, '{}PostALLRoiSet.zip'.format(name_short)), post_result_imp)
 
         # --- Marker Channel Gating ---
@@ -1990,7 +1993,7 @@ class SynapseJ4ChannelComplete(object):
             
             # Apply Median blur IN-PLACE (no duplication, no background subtraction)
             # SynapseJ unconditionally applies: run("Median...", "radius="+PreBlurPx+" stack");
-            IJ.run(marker_imp, "Median...", "radius=" + str(self.pre_blur_radius) + " stack")
+            self._median_filter_marker(marker_imp, self.pre_blur_radius)
             
             # DEBUG: Check marker channel stats AFTER blur
             post_blur_stats = ImageStatistics.getStatistics(marker_imp.getProcessor(), ImageStatistics.MEAN | ImageStatistics.MIN_MAX, marker_imp.getCalibration())
@@ -2023,7 +2026,7 @@ class SynapseJ4ChannelComplete(object):
                 pre_result_imp,
                 pre_mask_imp,
                 name_short,
-                'PreThrResults.txt',
+                'PreThrResults.tsv',
                 cal,
                 mask_name_for_bug=pre_mask_name,
                 marker_channel_name="C{}-image".format(self.pre_marker_channel)
@@ -2046,7 +2049,7 @@ class SynapseJ4ChannelComplete(object):
             
             # Apply Median blur IN-PLACE (no duplication, no background subtraction)
             # SynapseJ unconditionally applies: run("Median...", "radius="+PostBlurPx+" stack");
-            IJ.run(marker_imp, "Median...", "radius=" + str(self.post_blur_radius) + " stack")
+            self._median_filter_marker(marker_imp, self.post_blur_radius)
             
             # Use the blurred marker channel for gating (same image that will be used in merge)
             processed_marker = marker_imp
@@ -2069,7 +2072,7 @@ class SynapseJ4ChannelComplete(object):
                 post_result_imp,
                 post_mask_imp,
                 name_short,
-                'PstRResults.txt',
+                'PstRResults.tsv',
                 cal,
                 mask_name_for_bug=post_mask_name,
                 marker_channel_name="C{}-image".format(self.post_marker_channel)
@@ -2084,12 +2087,23 @@ class SynapseJ4ChannelComplete(object):
             
             # No cleanup needed - we modified channels[] in-place, which is needed for the merge
 
-        self.log('  Pre detections (gated): {}'.format(len(pre_entries)))
-        self.log('  Post detections (gated): {}'.format(len(post_entries)))
+        for role, number, entries in [('Pre', self.pre_channel, pre_entries),
+                                      ('Post', self.post_channel, post_entries)]:
+            if number:
+                self.log('  {} detections (gated): {}'.format(role, len(entries)))
 
-        if imp.getCalibration().pixelWidth == 1.0 and imp.getProperty("Resolution") != None:
-            # Attempt to parse resolution if available, similar to macro's getScaleAndUnit behavior
-            pass 
+        # A puncta-only run has no opposite staining channel. Leave unmeasured
+        # counts blank; zero is reserved for a measurement that found no objects.
+        if not (self.pre_channel and self.post_channel):
+            label, result = ('Pre', pre_result_imp) if self.pre_channel else ('Post', post_result_imp)
+            IJ.save(result, os.path.join(self.dest_dir, name_short + label + 'F.tif'))
+            self.save_overlay(pre_result_imp, post_result_imp, channels, name_short)
+            self.record_summary(name_short, pre_count_total if self.pre_channel else '',
+                                pre_marker_count, post_count_total if self.post_channel else '',
+                                post_marker_count, '', '')
+            self.log('Puncta-only analysis complete; pre/post overlap was not measured.')
+            self._image_index += 1
+            return
 
         # --- Synapse Finding ---
         # Identify synapses by checking for overlap between pre- and post-synaptic puncta.
@@ -2112,7 +2126,7 @@ class SynapseJ4ChannelComplete(object):
                                               self.pre_params['min'], 65535, get_pre_slice_label)
             # Per-image synaptic pre-synaptic results (Excel folder) - save BEFORE bug replication
             # Per-image files have correct thresholds; only aggregate Syn Results has zeroed thresholds
-            self.save_results_table(self._filter_standard_metrics(syn_pre_rows), os.path.join(self.excel_dir, '{}PreResults.txt'.format(name_short)))
+            self.save_results_table(self._filter_standard_metrics(syn_pre_rows), os.path.join(self.excel_dir, '{}PreResults.tsv'.format(name_short)))
             # Use pre_roi_index_map to preserve original indices from PreALLRoiSet
             self.save_roi_set(syn_pre_rois, os.path.join(self.dest_dir, '{}PreSYNRoiSet.zip'.format(name_short)), pre_result_imp, pre_roi_index_map)
             
@@ -2130,7 +2144,7 @@ class SynapseJ4ChannelComplete(object):
             syn_post_rows = self.measure_rois(syn_post_rois, post_result_imp, name_short, 'Post', cal,
                                                self.post_params['min'], 65535, get_post_slice_label)
             # Per-image synaptic post-synaptic results (Excel folder) - save BEFORE bug replication
-            self.save_results_table(self._filter_standard_metrics(syn_post_rows), os.path.join(self.excel_dir, '{}PostResults.txt'.format(name_short)))
+            self.save_results_table(self._filter_standard_metrics(syn_post_rows), os.path.join(self.excel_dir, '{}PostResults.tsv'.format(name_short)))
             # Use post_roi_index_map to preserve original indices from PostALLRoiSet
             self.save_roi_set(syn_post_rois, os.path.join(self.dest_dir, '{}PostSYNRoiSet.zip'.format(name_short)), post_result_imp, post_roi_index_map)
             
@@ -2183,13 +2197,7 @@ class SynapseJ4ChannelComplete(object):
         if pre_label_map: pre_label_map.close()
         if post_label_map: post_label_map.close()
         
-        # Save Overlay (4 channels, no outlines) - matches SynapseJ merge output
-        # NOTE: The macro applies Median blur IN-PLACE to marker channels (C1, C2) during marker gating.
-        # When the merge happens, it uses those blurred versions. We must replicate this behavior.
-        # The blur was already applied to channels[] during marker gating above (in-place via _preprocess_channel_inplace).
-        c1_imp = channels[0] # C1 (post_marker_channel, blurred if marker gating enabled)
-        c2_imp = channels[1] # C2 (pre_marker_channel, blurred if marker gating enabled)
-        self.save_overlay(pre_result_imp, post_result_imp, c1_imp, c2_imp, name_short)
+        self.save_overlay(pre_result_imp, post_result_imp, channels, name_short)
 
         # Generate Presentation Outputs (Batch Synapse Report only)
         # Pass original measurement images (pre_measure, post_measure) for IntDen calculation
@@ -2481,7 +2489,7 @@ class SynapseJ4ChannelComplete(object):
         # DEBUG: Print calibration info
         if cal:
             self.log("DEBUG {}: Calibration: pixelWidth={}, pixelHeight={}, unit={}".format(
-                label, cal.pixelWidth, cal.pixelHeight, cal.getUnit()))
+                label, cal.pixelWidth, cal.pixelHeight, cal.getUnit().encode('utf-8')))
             pixel_area = cal.pixelWidth * cal.pixelHeight
             self.log("DEBUG {}: pixel_area = {} um^2, pixels_per_um = {}".format(
                 label, pixel_area, 1.0/cal.pixelWidth if cal.pixelWidth > 0 else "N/A"))
@@ -2819,8 +2827,8 @@ class SynapseJ4ChannelComplete(object):
         # Combine results from all slices and assign final indices
         # Build labels in og2 format: {image}F.tif:{slice:04d}-{index:04d}-{y:04d}:{slice_label}
         # Example: AK5-2001PreF.tif:0001-0034-0091:c:4/4 z:1/5 - AK5-2001.nd2 (series 1)
-        # Note: For "All Results" (Pre.txt/Post.txt), the label should be SIMPLE (base_name).
-        # The COMPLEX label is used for "Syn Results" (PreResults.txt/PostResults.txt).
+        # Note: For "All Results" (Pre.tsv/Post.tsv), the label should be SIMPLE (base_name).
+        # The COMPLEX label is used for "Syn Results" (PreResults.tsv/PostResults.tsv).
         # We set the ROI name to the SSSS-NNNN-YYYY format so measure_rois can reconstruct the complex label later.
         
         entries = []
@@ -3365,54 +3373,34 @@ class SynapseJ4ChannelComplete(object):
         # Return the index map for use by subset saves
         return new_roi_index_map
 
-    def save_overlay(self, pre_src, post_src, c1_imp, c2_imp, base_name):
-        """
-        Create and save a multi-channel composite overlay image.
-        
-        This generates the "PrePost" merged image, which provides a visual summary of the analysis.
-        It combines the processed pre- and post-synaptic channels (after background subtraction)
-        with the original marker channels.
-        
-        Channel Mapping (Standard ImageJ Colors):
-        - Channel 1 (Red): Processed Pre-synaptic (PreF)
-        - Channel 2 (Green): Processed Post-synaptic (PostF)
-        - Channel 3 (Blue): Original Post-Marker (C1)
-        - Channel 4 (Gray): Original Pre-Marker (C2)
-        
-        Args:
-            pre_src (ImagePlus): Processed pre-synaptic image.
-            post_src (ImagePlus): Processed post-synaptic image.
-            c1_imp (ImagePlus): Original Channel 1 (Post Marker).
-            c2_imp (ImagePlus): Original Channel 2 (Pre Marker).
-            base_name (str): Base filename for saving.
-        """
-        # Duplicate all images to avoid modifying the originals during the merge process.
-        # This is crucial because 'RGBStackMerge' might alter the input stack properties.
-        c1 = pre_src.duplicate()
-        c2 = post_src.duplicate()
-        c3 = c1_imp.duplicate()
-        c4 = c2_imp.duplicate()
-        
-        # Merge Channels
-        # The order in the list determines the channel assignment (Red, Green, Blue, Gray, etc.)
-        # [c1, c2, c3, c4] maps to:
-        # 1. Red: Pre-synaptic
-        # 2. Green: Post-synaptic
-        # 3. Blue: Post-Marker
-        # 4. Gray: Pre-Marker
-        merged = RGBStackMerge.mergeChannels([c1, c2, c3, c4], True)
-        
-        # Save the merged composite image
-        if merged is not None:
-            out_path = os.path.join(self.merge_dir, '{}PrePost.tif'.format(base_name))
-            IJ.save(merged, out_path)
-            merged.close()
-        
-        # Clean up duplicates to free memory
-        c1.close()
-        c2.close()
-        c3.close()
-        c4.close()
+    def _median_filter_marker(self, image, radius):
+        """Apply ImageJ's median filter in place to every marker plane."""
+        stack = image.getStack()
+        median = RankFilters()
+        for index in range(1, stack.getSize() + 1):
+            median.rank(stack.getProcessor(index), radius, RankFilters.MEDIAN)
+
+    def save_overlay(self, pre, post, channels, base_name):
+        """Merge assigned channels in legacy role order, omitting absent roles."""
+        sources = [im for im in (pre, post) if im is not None]
+        for number in (self.post_marker_channel, self.pre_marker_channel):
+            if number:
+                sources.append(channels[number - 1])
+        if len(sources) == 1:
+            return  # Already saved as PreF.tif or PostF.tif.
+        copies = [im.duplicate() for im in sources]
+        merged = None
+        try:
+            merged = RGBStackMerge.mergeChannels(copies, True)
+            if merged is None:
+                raise ValueError('Could not merge channels for ' + base_name)
+            suffix = 'PrePost' if pre is not None and post is not None else 'PrimaryMarker'
+            IJ.save(merged, os.path.join(self.merge_dir, base_name + suffix + '.tif'))
+        finally:
+            if merged is not None:
+                merged.close()
+            for im in copies:
+                im.close()
 
     def record_summary(self, base_name, pre_count, pre_marker_count, post_count, post_marker_count,
                        syn_post_count, syn_pre_count):
@@ -3456,7 +3444,7 @@ class SynapseJ4ChannelComplete(object):
         """
         # Save the summary table (Collated ResultsIF) which contains one row per image.
         if self.results_summary:
-            self.save_results_table(self.results_summary, os.path.join(self.dest_dir, 'Collated ResultsIF.txt'))
+            self.save_results_table(self.results_summary, os.path.join(self.dest_dir, 'Collated ResultsIF.tsv'))
         
         # Determine the first image label for combined files.
         # og2 behavior: first image processed uses 3-decimal format, subsequent images use AUTO_FORMAT.
@@ -3482,31 +3470,31 @@ class SynapseJ4ChannelComplete(object):
         # Use _filter_all_results_metrics for simple Label format (no thresholds)
         # Combined files use first_image_label to match og2's per-image formatting behavior.
         if self.all_pre_results:
-            self.save_results_table(self._filter_all_results_metrics(self.all_pre_results), os.path.join(self.dest_dir, 'All Pre Results.txt'), first_image_label=first_image_label)
+            self.save_results_table(self._filter_all_results_metrics(self.all_pre_results), os.path.join(self.dest_dir, 'All Pre Results.tsv'), first_image_label=first_image_label)
             
         # Save the detailed list of ALL detected post-synaptic puncta (before synapse filtering).
         if self.all_post_results:
-            self.save_results_table(self._filter_all_results_metrics(self.all_post_results), os.path.join(self.dest_dir, 'All Post Results.txt'), first_image_label=first_image_label)
+            self.save_results_table(self._filter_all_results_metrics(self.all_post_results), os.path.join(self.dest_dir, 'All Post Results.tsv'), first_image_label=first_image_label)
             
         # Save the list of CONFIRMED synaptic pre-puncta (those that colocalized).
         # Use _filter_standard_metrics for full Label format (with thresholds)
         if self.syn_pre_results:
-            self.save_results_table(self._filter_standard_metrics(self.syn_pre_results), os.path.join(self.dest_dir, 'Syn Pre Results.txt'), first_image_label=first_image_label)
+            self.save_results_table(self._filter_standard_metrics(self.syn_pre_results), os.path.join(self.dest_dir, 'Syn Pre Results.tsv'), first_image_label=first_image_label)
             
         # Save the list of CONFIRMED synaptic post-puncta (those that colocalized).
         if self.syn_post_results:
-            self.save_results_table(self._filter_standard_metrics(self.syn_post_results), os.path.join(self.dest_dir, 'Syn Post Results.txt'), first_image_label=first_image_label)
+            self.save_results_table(self._filter_standard_metrics(self.syn_post_results), os.path.join(self.dest_dir, 'Syn Post Results.tsv'), first_image_label=first_image_label)
             
         # Save the paired synapse data (currently unused/empty in this implementation but kept for compatibility).
         if self.synapse_pair_rows:
             self.save_results_table(self.synapse_pair_rows, os.path.join(self.dest_dir, 'AllSynapsePairs.tsv'))
             
         # Save the Pre->Post correlation analysis results (nearest neighbor data).
-        if self.pre_correlation_rows:
+        if self.pre_channel and self.post_channel and self.pre_correlation_rows:
             self.save_text_lines(self.pre_correlation_rows, os.path.join(self.dest_dir, 'CorrResults.txt'))
             
         # Save the Post->Pre correlation analysis results (nearest neighbor data).
-        if self.post_correlation_rows:
+        if self.pre_channel and self.post_channel and self.post_correlation_rows:
             self.save_text_lines(self.post_correlation_rows, os.path.join(self.dest_dir, 'CorrResults2.txt'))
         
         # Save the batch synapse report (accumulated from all images) as proper CSV
@@ -3606,7 +3594,7 @@ class SynapseJ4ChannelComplete(object):
         
         # Define subdirectories
         self.merge_dir = os.path.join(self.dest_dir, 'merge')
-        self.excel_dir = os.path.join(self.dest_dir, 'excel')
+        self.excel_dir = os.path.join(self.dest_dir, 'result_tables')
         
         # Create output directories if needed
         for folder in [self.dest_dir, self.merge_dir, self.excel_dir]:
@@ -4791,6 +4779,12 @@ class SynapseJ4ChannelComplete(object):
             pre_measure_imp (ImagePlus): Original pre-synaptic image for intensity measurement.
             post_measure_imp (ImagePlus): Original post-synaptic image for intensity measurement.
         """
+        used = [self.pre_channel, self.post_channel]
+        if self.pre_marker_channel and self.pre_marker_thresholds:
+            used.append(self.pre_marker_channel)
+        if self.post_marker_channel and self.post_marker_thresholds:
+            used.append(self.post_marker_channel)
+        included_channels = ','.join('C{}'.format(n) for n in sorted(used))
         synapse_rows = []
         
         # Create ROI-to-entry lookup for quick access
@@ -5132,7 +5126,7 @@ class SynapseJ4ChannelComplete(object):
                 row = OrderedDict([
                     ('Image Name', base_name),
                     ('Puncta ID', complete_id),
-                    ('Included Channels', 'C1,C2,C3,C4'),
+                    ('Included Channels', included_channels),
                     ('Type', 'Complete'),
                     ('Overlap (px)', overlap_px),
                     ('Overlap (um^2)', fmt(overlap_px * self._pixel_area(cal))),
